@@ -1,0 +1,5 @@
+{
+  "name": "Bilingual Book Generator",
+  "description": "Generates side-by-side English-Turkish bilingual texts for books using AI.",
+  "requestFramePermissions": []
+}
