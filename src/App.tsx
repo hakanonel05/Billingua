@@ -135,6 +135,14 @@ async function translateBatch(texts: TranslationPayload[], config: AppConfig, pa
   }
 
   // Fallback or Default: Google Translate via Proxy (batchexecute)
+  // Check if we are potentially on a static host like Netlify where /api might 404
+  const isStaticHost = window.location.hostname.includes('netlify.app') || 
+                       window.location.hostname.includes('github.io') ||
+                       window.location.hostname.includes('vercel.app');
+
+  if (config.engine === 'gtx' && isStaticHost) {
+    console.warn("Detected static host. Client-side Google Translate (GTX) might fail due to CORS. Gemini is recommended for static hosts.");
+  }
   const MAX_CHARS = 2000;
   const chunks: TranslationPayload[][] = [];
   let currentChunk: TranslationPayload[] = [];
@@ -167,13 +175,18 @@ async function translateBatch(texts: TranslationPayload[], config: AppConfig, pa
       try {
         if (pauseRef.current) break;
         
-        const response = await fetch('/api/process-text', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: combinedText, targetLang: config.targetLang, sourceLang: config.sourceLang })
-        });
+        let response;
+        try {
+          response = await fetch('/api/process-text', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: combinedText, targetLang: config.targetLang, sourceLang: config.sourceLang })
+          });
+        } catch (fetchErr) {
+          console.error("Proxy fetch failed, will try direct gtx", fetchErr);
+        }
         
-        if (response.ok) {
+        if (response && response.ok) {
           const data = await response.json();
           const translatedCombined = data.translation || '';
           
@@ -188,8 +201,25 @@ async function translateBatch(texts: TranslationPayload[], config: AppConfig, pa
             await new Promise(r => setTimeout(r, 300)); // Small delay after success to avoid rate limits
           } else {
             console.warn(`Delimiter mismatch in batch translation (expected ${chunk.length}, got ${translatedParts.length}), retry ${retries}/${MAX_RETRIES}`);
-            if (retries === MAX_RETRIES) {
-              console.warn("Falling back to sequential after retries");
+          }
+        } else if (!response || response.status === 404 || response.status === 502) {
+          // Fallback to DIRECT Google Translate if proxy is missing (Netlify 404)
+          console.log("Proxy missing or 404. Attempting direct client-side Google Translate...");
+          const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${config.sourceLang}&tl=${config.targetLang}&dt=t&q=${encodeURIComponent(combinedText)}`;
+          const directRes = await fetch(url);
+          if (directRes.ok) {
+            const data = await directRes.json();
+            let translatedDirect = '';
+            if (data && data[0]) {
+              data[0].forEach((s: any) => { if (s[0]) translatedDirect += s[0]; });
+            }
+            
+            const translatedParts = translatedDirect.split(/(?:\s*\|\|\|\s*)+/).filter(p => p.trim() !== '');
+            if (translatedParts.length === chunk.length) {
+              chunk.forEach((item, idx) => {
+                results.push({ id: item.id, translation: translatedParts[idx].trim() || item.text });
+              });
+              success = true;
             }
           }
         } else {
