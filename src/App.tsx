@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, Type } from '@google/genai';
 import JSZip from 'jszip';
+import { del, keys } from 'idb-keyval';
 import { BookOpen, UploadCloud, Download, Loader2, CheckCircle, Layout, FileText, AlertCircle, Settings, Play, Pause, Book, Type as TypeIcon, Globe, ArrowLeft, RotateCcw, Library, Moon, Sun, Trash2, Volume2, Square, Zap, Shield, ArrowRight, Layers, X, Info, Gauge, ChevronRight, ChevronDown, Check } from 'lucide-react';
 import { saveBookToLibrary, getLibraryBooks, deleteBookFromLibrary, SavedBook } from './lib/db';
 import { analyzeCEFR, getComprehensionPercentage, CEFRLevelStats } from './lib/cefr';
@@ -1739,6 +1740,30 @@ export default function App() {
                               <p className={`text-xs mt-0.5 ${isDarkMode ? 'text-emerald-200/60' : 'text-emerald-700/70'}`}>Include the sentence where the word was found in the glossary.</p>
                             </div>
                           </label>
+                          <div className="pt-4 border-t border-slate-200 dark:border-slate-800">
+                            <h4 className="text-sm font-semibold text-red-600 mb-2">Tehlikeli Bölge</h4>
+                            <p className="text-xs text-slate-500 mb-3">Tüm kütüphaneyi ve uygulama ayarlarını sıfırlar. Bu işlem geri alınamaz.</p>
+                            <button 
+                              onClick={async () => {
+                                if (confirm('Tüm kütüphaneyi ve uygulama verilerini silmek istediğinizden emin misiniz?')) {
+                                  try {
+                                    // Clear IndexedDB via idb-keyval
+                                    const allKeys = await keys();
+                                    await Promise.all(allKeys.map(k => del(k)));
+                                    // Clear localStorage
+                                    localStorage.clear();
+                                    alert('Tüm veriler temizlendi. Uygulama yeniden başlatılıyor.');
+                                    window.location.reload();
+                                  } catch (err) {
+                                    alert('Veriler silinirken bir hata oluştu.');
+                                  }
+                                }
+                              }}
+                              className="flex items-center gap-2 px-4 py-2 bg-red-50 text-red-600 hover:bg-red-100 dark:bg-red-900/20 dark:text-red-400 dark:hover:bg-red-900/30 rounded-lg text-sm font-medium transition-colors w-full justify-center"
+                            >
+                              <Trash2 className="w-4 h-4" /> Tüm Verileri ve Önbelleği Sıfırla
+                            </button>
+                          </div>
                         </div>
                       </div>
                     )}
