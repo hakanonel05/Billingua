@@ -513,6 +513,7 @@ export default function App() {
       
       const parsedChapters: Chapter[] = [];
       const initialPreviews: Record<string, string> = {};
+      const analysisTextParts: string[] = [];
       
       for (const itemref of spineItems) {
         const idref = itemref.getAttribute("idref");
@@ -531,6 +532,9 @@ export default function App() {
                 
                 // Store initial preview content
                 initialPreviews[idref || fullPath] = htmlDoc.body.innerHTML;
+                
+                // Collect clean text for analysis
+                analysisTextParts.push(htmlDoc.body.textContent || "");
 
                 let extractedTitle = "";
                 const titleTag = htmlDoc.querySelector("title");
@@ -596,8 +600,8 @@ export default function App() {
       setChapters(parsedChapters);
       setPreviews(initialPreviews);
       
-      // Perform CEFR analysis on a sample of text or whole text
-      const fullTextSample = Object.values(initialPreviews).join(' ').substring(0, 100000);
+      // Perform CEFR analysis on clean text
+      const fullTextSample = analysisTextParts.join(' ').substring(0, 200000);
       const stats = analyzeCEFR(fullTextSample);
       setCefrStats(stats);
       
