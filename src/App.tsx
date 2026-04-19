@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, Type } from '@google/genai';
 import JSZip from 'jszip';
-import { BookOpen, UploadCloud, Download, Loader2, CheckCircle, Layout, FileText, AlertCircle, Settings, Play, Pause, Book, Type as TypeIcon, Globe, ArrowLeft, RotateCcw, Library, Moon, Sun, Trash2, Volume2, Square } from 'lucide-react';
+import { BookOpen, UploadCloud, Download, Loader2, CheckCircle, Layout, FileText, AlertCircle, Settings, Play, Pause, Book, Type as TypeIcon, Globe, ArrowLeft, RotateCcw, Library, Moon, Sun, Trash2, Volume2, Square, Zap, Shield, ArrowRight, Layers, X } from 'lucide-react';
 import { saveBookToLibrary, getLibraryBooks, deleteBookFromLibrary, SavedBook } from './lib/db';
 
 // --- Types & Interfaces ---
@@ -61,6 +61,27 @@ const LANGUAGES = [
   { code: 'ja', name: 'Japanese' },
   { code: 'ru', name: 'Russian' },
   { code: 'zh-CN', name: 'Chinese (Simplified)' },
+  { code: 'zh-TW', name: 'Chinese (Traditional)' },
+  { code: 'pt', name: 'Portuguese' },
+  { code: 'ar', name: 'Arabic' },
+  { code: 'ko', name: 'Korean' },
+  { code: 'hi', name: 'Hindi' },
+  { code: 'nl', name: 'Dutch' },
+  { code: 'pl', name: 'Polish' },
+  { code: 'sv', name: 'Swedish' },
+  { code: 'no', name: 'Norwegian' },
+  { code: 'da', name: 'Danish' },
+  { code: 'fi', name: 'Finnish' },
+  { code: 'el', name: 'Greek' },
+  { code: 'he', name: 'Hebrew' },
+  { code: 'th', name: 'Thai' },
+  { code: 'vi', name: 'Vietnamese' },
+  { code: 'id', name: 'Indonesian' },
+  { code: 'ms', name: 'Malay' },
+  { code: 'ro', name: 'Romanian' },
+  { code: 'hu', name: 'Hungarian' },
+  { code: 'cs', name: 'Czech' },
+  { code: 'uk', name: 'Ukrainian' },
 ];
 
 // --- Translation Engine ---
@@ -95,7 +116,7 @@ async function translateWithGemini(texts: TranslationPayload[], config: AppConfi
   throw new Error("Empty response from Gemini");
 }
 
-async function translateBatch(texts: TranslationPayload[], config: AppConfig): Promise<TranslationResult[]> {
+async function translateBatch(texts: TranslationPayload[], config: AppConfig, pauseRef: React.MutableRefObject<boolean>): Promise<TranslationResult[]> {
   const results: TranslationResult[] = [];
   let geminiOutOfQuota = false;
   
@@ -112,66 +133,97 @@ async function translateBatch(texts: TranslationPayload[], config: AppConfig): P
     }
   }
 
-  // Fallback or Default: Google Translate GTX via Proxy
-  const BATCH_SIZE = 5; // Reduce batch size to avoid 500 errors from Google Translate
-  for (let i = 0; i < texts.length; i += BATCH_SIZE) {
-    const chunk = texts.slice(i, i + BATCH_SIZE);
+  // Fallback or Default: Google Translate via Proxy (batchexecute)
+  const MAX_CHARS = 2000;
+  const chunks: TranslationPayload[][] = [];
+  let currentChunk: TranslationPayload[] = [];
+  let currentCharCount = 0;
+
+  for (const item of texts) {
+    const itemLen = item.text.length + 10; // +10 for delimiter
+    if (currentCharCount + itemLen > MAX_CHARS && currentChunk.length > 0) {
+      chunks.push(currentChunk);
+      currentChunk = [item];
+      currentCharCount = itemLen;
+    } else {
+      currentChunk.push(item);
+      currentCharCount += itemLen;
+    }
+  }
+  if (currentChunk.length > 0) {
+    chunks.push(currentChunk);
+  }
+
+  for (const chunk of chunks) {
     const combinedText = chunk.map(t => t.text).join('\n\n|||\n\n');
     
     let success = false;
     let isRateLimited = false;
-    try {
-      const response = await fetch('/api/process-text', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: combinedText, targetLang: config.targetLang, sourceLang: config.sourceLang })
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        let translatedCombined = '';
-        if (data && data[0]) {
-          data[0].forEach((segment: any) => {
-            if (segment[0]) translatedCombined += segment[0];
-          });
-        }
+    let retries = 0;
+    const MAX_RETRIES = 2;
+
+    while (!success && retries <= MAX_RETRIES) {
+      try {
+        if (pauseRef.current) break;
         
-        // Google translate might add spaces around |||
-        const translatedParts = translatedCombined.split(/(?:\s*\|\|\|\s*)+/);
+        const response = await fetch('/api/process-text', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: combinedText, targetLang: config.targetLang, sourceLang: config.sourceLang })
+        });
         
-        if (translatedParts.length === chunk.length) {
-          chunk.forEach((item, idx) => {
-            results.push({ id: item.id, translation: translatedParts[idx].trim() || item.text });
-          });
-          success = true;
+        if (response.ok) {
+          const data = await response.json();
+          const translatedCombined = data.translation || '';
+          
+          // Improved delimiter splitting: handle various whitespace and potential Google Translate artifacts
+          const translatedParts = translatedCombined.split(/(?:\s*\|\|\|\s*)+/).filter(p => p.trim() !== '');
+          
+          if (translatedParts.length === chunk.length) {
+            chunk.forEach((item, idx) => {
+              results.push({ id: item.id, translation: translatedParts[idx].trim() || item.text });
+            });
+            success = true;
+            await new Promise(r => setTimeout(r, 300)); // Small delay after success to avoid rate limits
+          } else {
+            console.warn(`Delimiter mismatch in batch translation (expected ${chunk.length}, got ${translatedParts.length}), retry ${retries}/${MAX_RETRIES}`);
+            if (retries === MAX_RETRIES) {
+              console.warn("Falling back to sequential after retries");
+            }
+          }
         } else {
-          console.warn("Delimiter mismatch in batch translation, falling back to sequential");
+          console.warn(`Proxy API returned ${response.status}, retry ${retries}/${MAX_RETRIES}`);
+          if (response.status === 429) {
+            isRateLimited = true;
+            await new Promise(r => setTimeout(r, 1000 * (retries + 1))); // Exponential backoff
+          }
         }
-      } else {
-        console.warn(`Proxy API returned ${response.status}`);
-        if (response.status === 429) {
-          isRateLimited = true;
-        }
+      } catch (err) {
+        console.error("Batch translation error", err);
       }
-    } catch (err) {
-      console.error("Batch translation error", err);
+      
+      if (success) break;
+      retries++;
+      if (retries <= MAX_RETRIES) {
+        await new Promise(r => setTimeout(r, 500)); // Short wait before retry
+      }
     }
 
     if (!success) {
       if (isRateLimited) {
         console.log("Rate limited by Google Translate. Waiting before fallback...");
-        await new Promise(r => setTimeout(r, 3000)); // Wait 3s if rate limited
+        await new Promise(r => setTimeout(r, 2000));
       }
 
-      // If GTX batch fails, and we have gtx-fallback enabled, try Gemini for the whole chunk
+      // If batch fails, and we have gtx-fallback enabled, try Gemini for the whole chunk
       if (config.engine === 'gtx-fallback' && config.apiKey && !geminiOutOfQuota) {
         try {
-          console.log("GTX failed, falling back to Gemini for chunk...");
+          console.log("Batch failed, falling back to Gemini for chunk...");
           const geminiResults = await translateWithGemini(chunk, config);
           results.push(...geminiResults);
-          continue; // Skip sequential GTX if Gemini succeeds
+          continue; // Skip sequential if Gemini succeeds
         } catch (geminiErr: any) {
-          console.error("Gemini fallback also failed, trying sequential GTX", geminiErr);
+          console.error("Gemini fallback also failed, trying sequential", geminiErr);
           const errMsg = geminiErr?.message || String(geminiErr);
           if (errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('RESOURCE_EXHAUSTED')) {
             geminiOutOfQuota = true;
@@ -182,29 +234,35 @@ async function translateBatch(texts: TranslationPayload[], config: AppConfig): P
       // Fallback to sequential individual requests
       for (const item of chunk) {
         let itemSuccess = false;
-        try {
-          const response = await fetch('/api/process-text', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: item.text, targetLang: config.targetLang, sourceLang: config.sourceLang })
-          });
-          if (response.ok) {
-            const data = await response.json();
-            let trans = '';
-            if (data && data[0]) {
-              data[0].forEach((s: any) => { if (s[0]) trans += s[0]; });
+        let itemRetries = 0;
+        const MAX_ITEM_RETRIES = 2;
+
+        while (!itemSuccess && itemRetries <= MAX_ITEM_RETRIES) {
+          try {
+            const response = await fetch('/api/process-text', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ text: item.text, targetLang: config.targetLang, sourceLang: config.sourceLang })
+            });
+            if (response.ok) {
+              const data = await response.json();
+              results.push({ id: item.id, translation: (data.translation || '').trim() || item.text });
+              itemSuccess = true;
+            } else if (response.status === 429) {
+               await new Promise(r => setTimeout(r, 1000 * (itemRetries + 1)));
             }
-            results.push({ id: item.id, translation: trans.trim() || item.text });
-            itemSuccess = true;
-          } else if (response.status === 429) {
-             await new Promise(r => setTimeout(r, 2000)); // Wait extra if rate limited sequentially
+          } catch (e) {
+            console.error(`Sequential error (retry ${itemRetries})`, e);
           }
-        } catch (e) {
-          console.error("Sequential GTX error", e);
+          if (itemSuccess) break;
+          itemRetries++;
+          if (itemRetries <= MAX_ITEM_RETRIES) {
+            await new Promise(r => setTimeout(r, 300));
+          }
         }
         
         if (!itemSuccess) {
-          // If sequential GTX fails, and we have gtx-fallback enabled, try Gemini for this single item
+          // If sequential fails, and we have gtx-fallback enabled, try Gemini for this single item
           if (config.engine === 'gtx-fallback' && config.apiKey && !geminiOutOfQuota) {
             try {
               const geminiResult = await translateWithGemini([item], config);
@@ -225,10 +283,10 @@ async function translateBatch(texts: TranslationPayload[], config: AppConfig): P
             results.push({ id: item.id, translation: item.text }); // Ultimate fallback: original text
           }
         }
-        await new Promise(r => setTimeout(r, 1000)); // Increased delay between individual requests
+        await new Promise(r => setTimeout(r, 100)); // Minimal delay for speed
       }
     } else {
-      await new Promise(r => setTimeout(r, 1500)); // Increased delay between batches
+      await new Promise(r => setTimeout(r, 500)); // Increased from 200 to avoid 500 errors
     }
   }
   return results;
@@ -279,7 +337,7 @@ const createSampleEpub = async (): Promise<File> => {
 
 // --- Main App Component ---
 export default function App() {
-  const [currentView, setCurrentView] = useState<'translator' | 'library'>('translator');
+  const [currentView, setCurrentView] = useState<'home' | 'translator' | 'library'>('home');
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [libraryBooks, setLibraryBooks] = useState<SavedBook[]>([]);
 
@@ -319,6 +377,11 @@ export default function App() {
   const [finalBlob, setFinalBlob] = useState<Blob | null>(null);
   const [isSpeaking, setIsSpeaking] = useState(false);
   
+  const [dictionaryWord, setDictionaryWord] = useState<string | null>(null);
+  const [dictionaryData, setDictionaryData] = useState<any>(null);
+  const [dictionaryLoading, setDictionaryLoading] = useState(false);
+  const [dictionaryPos, setDictionaryPos] = useState({ x: 0, y: 0 });
+
   const glossaryTermsRef = useRef<{source: string, target: string, type: 'word'|'idiom', contextEn: string, contextTr: string}[]>([]);
 
   useEffect(() => {
@@ -394,6 +457,26 @@ export default function App() {
     }
   };
 
+  const setSafeHTML = (el: Element, html: string, doc: Document) => {
+    try {
+      el.innerHTML = html;
+    } catch (e) {
+      // XML documents are strict about innerHTML. Fallback to manual node import.
+      const parser = new DOMParser();
+      const tempDoc = parser.parseFromString(`<div>${html}</div>`, 'text/html');
+      const container = tempDoc.body.firstChild;
+      if (container) {
+        el.innerHTML = '';
+        Array.from(container.childNodes).forEach(node => {
+          const imported = doc.importNode(node, true);
+          el.appendChild(imported);
+        });
+      } else {
+        el.textContent = html;
+      }
+    }
+  };
+
   // --- Step 1: File Upload & Parsing ---
   const handleFile = async (uploadedFile: File) => {
     setFile(uploadedFile);
@@ -422,6 +505,8 @@ export default function App() {
       const basePath = opfFullPath.substring(0, opfFullPath.lastIndexOf('/') + 1);
       
       const parsedChapters: Chapter[] = [];
+      const initialPreviews: Record<string, string> = {};
+      
       for (const itemref of spineItems) {
         const idref = itemref.getAttribute("idref");
         const manifestItem = manifestItems.find(item => item.getAttribute("id") === idref);
@@ -437,6 +522,9 @@ export default function App() {
               if (htmlContent) {
                 const htmlDoc = parser.parseFromString(htmlContent, "text/html");
                 
+                // Store initial preview content
+                initialPreviews[idref || fullPath] = htmlDoc.body.innerHTML;
+
                 let extractedTitle = "";
                 const titleTag = htmlDoc.querySelector("title");
                 const titleText = titleTag?.textContent?.trim() || "";
@@ -499,6 +587,10 @@ export default function App() {
       }
       
       setChapters(parsedChapters);
+      setPreviews(initialPreviews);
+      if (parsedChapters.length > 0) {
+        setActivePreviewId(parsedChapters[0].id);
+      }
       setStep(2);
     } catch (err: any) {
       setErrorMsg(err.message || "Failed to parse EPUB file.");
@@ -590,7 +682,7 @@ export default function App() {
         setProgress(p => ({ ...p, chapterTitle: 'Translating glossary terms...' }));
         const payload = topItems.map((item, i) => ({ id: i, text: item[0] }));
         try {
-          const translations = await translateBatch(payload, config);
+          const translations = await translateBatch(payload, config, pauseRef);
           const terms = topItems.map((item, i) => {
             const trans = translations.find(t => t.id === i)?.translation || '';
             return { 
@@ -626,7 +718,7 @@ export default function App() {
         const elements = Array.from(htmlDoc.querySelectorAll("p, h1, h2, h3, h4, h5, h6, li"));
         
         if (elements.length > 0) {
-          const BATCH_SIZE = 10;
+          const BATCH_SIZE = 10; // Reduced from 15 to avoid 500 errors
           for (let j = 0; j < elements.length; j += BATCH_SIZE) {
             if (pauseRef.current) break;
             const batch = elements.slice(j, j + BATCH_SIZE);
@@ -646,7 +738,7 @@ export default function App() {
             
             let translations = [...cached];
             if (payload.length > 0) {
-              const apiTranslations = await translateBatch(payload, config);
+              const apiTranslations = await translateBatch(payload, config, pauseRef);
               apiTranslations.forEach(t => {
                 const originalText = payload.find(p => p.id === t.id)?.text;
                 if (originalText) translationMemory.set(originalText, t.translation);
@@ -689,9 +781,9 @@ export default function App() {
                     tdTr.setAttribute("style", "width: 50%; padding-left: 2%; vertical-align: top;");
                     
                     const translatedEl = el.cloneNode(false) as Element;
-                    translatedEl.innerHTML = targetText;
+                    setSafeHTML(translatedEl, targetText, htmlDoc);
                     
-                    el.innerHTML = sourceText;
+                    setSafeHTML(el, sourceText, htmlDoc);
                     
                     el.parentNode?.insertBefore(table, el);
                     tdEn.appendChild(el);
@@ -704,15 +796,27 @@ export default function App() {
                   else if (config.layout === 'interlinear') {
                     const transEl = htmlDoc.createElementNS("http://www.w3.org/1999/xhtml", el.tagName.toLowerCase());
                     transEl.setAttribute("style", `color: ${config.customColor}; background-color: ${config.customBg}; padding: 4px 8px; border-radius: 4px; margin-top: 4px; font-size: 0.95em; display: block;`);
-                    transEl.innerHTML = targetText;
-                    el.innerHTML = sourceText;
+                    setSafeHTML(transEl, targetText, htmlDoc);
+                    setSafeHTML(el, sourceText, htmlDoc);
                     el.parentNode?.insertBefore(transEl, el.nextSibling);
                   }
                   else if (config.layout === 'replace') {
-                    el.innerHTML = targetText;
+                    setSafeHTML(el, targetText, htmlDoc);
                   }
                 }
               });
+              
+              // --- LIVE PREVIEW UPDATE ---
+              if (!pauseRef.current) {
+                // For preview, we only want the body content to avoid <html>/<body> tags inside our preview div
+                const previewHtml = htmlDoc.body.innerHTML;
+                setPreviews(prev => {
+                  const newPreviews = { ...prev, [chapter.id]: previewHtml };
+                  return newPreviews;
+                });
+                // Switch to the currently translating chapter if no preview is active
+                setActivePreviewId(prevId => prevId || chapter.id);
+              }
             }
           }
         
@@ -729,11 +833,14 @@ export default function App() {
 
           const finalHtml = serializer.serializeToString(htmlDoc);
           zipInstance.file(chapter.fullPath, finalHtml);
+          
+          // Final preview update for this chapter
+          const finalPreviewHtml = htmlDoc.body.innerHTML;
           setPreviews(prev => {
-            const newPreviews = { ...prev, [chapter.id]: finalHtml };
-            if (!activePreviewId) setActivePreviewId(chapter.id);
+            const newPreviews = { ...prev, [chapter.id]: finalPreviewHtml };
             return newPreviews;
           });
+          setActivePreviewId(prevId => prevId || chapter.id);
           setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'done' } : c));
           processedCount++;
         }
@@ -881,28 +988,91 @@ export default function App() {
     setIsSpeaking(false);
   }, [activePreviewId]);
 
+  // Close dictionary popup on click outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dictionaryWord && !(e.target as Element).closest('.dictionary-popup')) {
+        setDictionaryWord(null);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [dictionaryWord]);
+
+  const handleTextSelection = async () => {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed) {
+      setDictionaryWord(null);
+      return;
+    }
+
+    const text = selection.toString().trim();
+    if (!text || text.includes(' ') || text.length < 2) {
+      setDictionaryWord(null);
+      return;
+    }
+
+    const range = selection.getRangeAt(0);
+    const rect = range.getBoundingClientRect();
+    
+    setDictionaryPos({
+      x: rect.left + rect.width / 2,
+      y: rect.bottom + window.scrollY
+    });
+    
+    setDictionaryWord(text);
+    setDictionaryLoading(true);
+    
+    try {
+      const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${text}`);
+      if (res.ok) {
+        const data = await res.json();
+        setDictionaryData(data[0]);
+      } else {
+        setDictionaryData(null);
+      }
+    } catch (error) {
+      setDictionaryData(null);
+    } finally {
+      setDictionaryLoading(false);
+    }
+  };
+
   // --- Render Helpers ---
   return (
-    <div className={`min-h-screen transition-colors duration-300 ${isDarkMode ? 'bg-stone-900 text-stone-100' : 'bg-stone-50 text-stone-800'} font-sans selection:bg-indigo-200`}>
-      <header className={`${isDarkMode ? 'bg-stone-900 border-stone-800' : 'bg-white border-stone-200'} border-b sticky top-0 z-10 shadow-sm transition-colors duration-300`}>
+    <div className={`min-h-screen transition-colors duration-300 ${isDarkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-800'} font-sans selection:bg-blue-200`}>
+      {/* Top Banner (like the screenshot) */}
+      <div className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-center py-2 px-4 text-sm font-medium flex items-center justify-center gap-2">
+        <span className="bg-white/20 px-2 py-0.5 rounded text-xs font-bold">NEW</span>
+        <span>Live Preview feature is now available! See translations in real-time.</span>
+      </div>
+
+      <header className={`${isDarkMode ? 'bg-slate-950/80 border-slate-800' : 'bg-white/80 border-slate-200'} backdrop-blur-md border-b sticky top-0 z-50 transition-colors duration-300`}>
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3 cursor-pointer" onClick={() => setCurrentView('translator')}>
-            <div className="bg-gradient-to-br from-indigo-500 to-purple-600 p-2 rounded-xl shadow-md">
+          <div className="flex items-center gap-3 cursor-pointer" onClick={() => setCurrentView('home')}>
+            <div className="bg-gradient-to-br from-blue-500 to-cyan-500 p-2 rounded-xl shadow-md">
               <BookOpen className="w-5 h-5 text-white" />
             </div>
-            <h1 className={`text-xl font-bold tracking-tight ${isDarkMode ? 'text-white' : 'text-stone-900'}`}>Bilingual EPUB Maker</h1>
+            <h1 className={`text-xl font-bold tracking-tight ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>Epub Master</h1>
           </div>
+          
+          <nav className="hidden md:flex items-center gap-8 font-medium text-sm">
+            <button onClick={() => setCurrentView('home')} className={`transition-colors ${currentView === 'home' ? 'text-blue-600 dark:text-blue-400' : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'}`}>Home</button>
+            <button onClick={() => setCurrentView('translator')} className={`transition-colors ${currentView === 'translator' ? 'text-blue-600 dark:text-blue-400' : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'}`}>Translate</button>
+            <button onClick={() => setCurrentView('library')} className={`transition-colors ${currentView === 'library' ? 'text-blue-600 dark:text-blue-400' : 'text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'}`}>Library</button>
+          </nav>
+
           <div className="flex items-center gap-4">
             <button 
               onClick={() => setCurrentView('library')}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg font-medium transition-colors ${currentView === 'library' ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/50 dark:text-indigo-300' : 'text-stone-600 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800'}`}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg font-medium transition-colors ${currentView === 'library' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300' : 'text-slate-600 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800'}`}
             >
               <Library className="w-5 h-5" />
               <span className="hidden sm:inline">My Library</span>
             </button>
             <button 
               onClick={() => setIsDarkMode(!isDarkMode)}
-              className="p-2 rounded-lg text-stone-500 hover:bg-stone-100 dark:text-stone-400 dark:hover:bg-stone-800 transition-colors"
+              className="p-2 rounded-lg text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800 transition-colors"
             >
               {isDarkMode ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
             </button>
@@ -911,26 +1081,114 @@ export default function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-8">
-        {currentView === 'library' ? (
+        {currentView === 'home' && (
+          <div className="animate-fade-in pb-20">
+            {/* Hero Section */}
+            <div className="relative pt-16 pb-24 text-center px-4 overflow-hidden">
+              <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-gradient-to-tr from-cyan-400/20 to-blue-500/20 rounded-full blur-3xl -z-10"></div>
+              
+              <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-300 font-medium text-sm mb-8 border border-blue-100 dark:border-blue-800/50">
+                <span className="w-2 h-2 rounded-full bg-blue-600 dark:bg-blue-400 animate-pulse"></span>
+                New: Real-time Live Preview Available
+              </div>
+              
+              <h1 className={`text-5xl md:text-7xl font-extrabold tracking-tight mb-6 ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>
+                Translate EPUBs <br className="hidden md:block" />
+                <span className="text-transparent bg-clip-text bg-gradient-to-r from-cyan-500 to-blue-600">Online & Free</span>
+              </h1>
+              
+              <p className={`text-xl mb-10 max-w-2xl mx-auto ${isDarkMode ? 'text-slate-400' : 'text-slate-600'}`}>
+                Professional-grade EPUB translation. Preserve formatting, style, and context in over 30 languages using advanced AI.
+              </p>
+              
+              <div className="flex flex-col sm:flex-row items-center justify-center gap-4 mb-16">
+                <button 
+                  onClick={() => setCurrentView('translator')} 
+                  className="flex items-center gap-2 bg-gradient-to-r from-cyan-500 to-blue-600 text-white px-8 py-4 rounded-full font-bold text-lg hover:shadow-lg hover:shadow-blue-500/30 transition-all hover:-translate-y-0.5 w-full sm:w-auto justify-center"
+                >
+                  Start Translation <ArrowRight className="w-5 h-5" />
+                </button>
+                <button 
+                  onClick={() => { document.getElementById('how-it-works')?.scrollIntoView({ behavior: 'smooth' }) }} 
+                  className={`flex items-center gap-2 px-8 py-4 rounded-full font-bold text-lg border transition-all w-full sm:w-auto justify-center ${isDarkMode ? 'bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-700' : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'}`}
+                >
+                  View Features
+                </button>
+              </div>
+              
+              <div className="flex flex-wrap justify-center gap-4 md:gap-8">
+                {[
+                  { icon: <UploadCloud className="w-5 h-5" />, text: "Easy Upload" },
+                  { icon: <Globe className="w-5 h-5" />, text: "30+ Languages" },
+                  { icon: <Shield className="w-5 h-5" />, text: "Secure & Private" },
+                  { icon: <Zap className="w-5 h-5" />, text: "Fast Processing" }
+                ].map((feature, i) => (
+                  <div key={i} className={`flex items-center gap-2 px-4 py-2 rounded-full border ${isDarkMode ? 'bg-slate-800/50 border-slate-700 text-slate-300' : 'bg-white border-slate-200 text-slate-600'} shadow-sm`}>
+                    {feature.icon}
+                    <span className="font-medium text-sm">{feature.text}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* How it Works Section */}
+            <div id="how-it-works" className="max-w-5xl mx-auto px-6 py-20">
+              <h2 className={`text-3xl font-bold text-center mb-16 ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>How to use Epub Master</h2>
+              <div className="grid md:grid-cols-3 gap-8">
+                {[
+                  {
+                    step: "01",
+                    title: "Upload your EPUB",
+                    desc: "Simply drag and drop your EPUB file. We securely parse the chapters and structure without altering the original formatting.",
+                    icon: <UploadCloud className="w-8 h-8 text-blue-500" />
+                  },
+                  {
+                    step: "02",
+                    title: "Configure Settings",
+                    desc: "Choose your target language, select a translation engine (Gemini or Google), and pick your preferred reading layout (Side-by-side or Interlinear).",
+                    icon: <Settings className="w-8 h-8 text-cyan-500" />
+                  },
+                  {
+                    step: "03",
+                    title: "Translate & Read",
+                    desc: "Watch the translation happen in real-time with Live Preview. Once done, download your new bilingual EPUB to any device.",
+                    icon: <BookOpen className="w-8 h-8 text-blue-500" />
+                  }
+                ].map((item, i) => (
+                  <div key={i} className={`p-8 rounded-3xl border relative overflow-hidden ${isDarkMode ? 'bg-slate-800/50 border-slate-700' : 'bg-white border-slate-100 shadow-xl shadow-slate-200/20'}`}>
+                    <div className={`text-6xl font-black absolute -top-4 -right-4 opacity-10 ${isDarkMode ? 'text-slate-500' : 'text-slate-300'}`}>{item.step}</div>
+                    <div className={`w-16 h-16 rounded-2xl flex items-center justify-center mb-6 ${isDarkMode ? 'bg-slate-800' : 'bg-blue-50'}`}>
+                      {item.icon}
+                    </div>
+                    <h3 className={`text-xl font-bold mb-3 ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>{item.title}</h3>
+                    <p className={`leading-relaxed ${isDarkMode ? 'text-slate-400' : 'text-slate-600'}`}>{item.desc}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {currentView === 'library' && (
           <div className="animate-fade-in">
             <div className="flex items-center justify-between mb-8">
-              <h2 className={`text-3xl font-bold ${isDarkMode ? 'text-stone-100' : 'text-stone-900'}`}>My Library</h2>
+              <h2 className={`text-3xl font-bold ${isDarkMode ? 'text-slate-100' : 'text-slate-900'}`}>My Library</h2>
               <button 
                 onClick={() => setCurrentView('translator')}
-                className="flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition-colors font-medium"
+                className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors font-medium"
               >
                 <UploadCloud className="w-4 h-4" /> Translate New Book
               </button>
             </div>
             
             {libraryBooks.length === 0 ? (
-              <div className={`text-center py-20 ${isDarkMode ? 'bg-stone-800 border-stone-700' : 'bg-white border-stone-200'} rounded-3xl border border-dashed`}>
-                <Library className={`w-16 h-16 mx-auto mb-4 ${isDarkMode ? 'text-stone-600' : 'text-stone-400'}`} />
-                <h3 className={`text-xl font-bold mb-2 ${isDarkMode ? 'text-stone-200' : 'text-stone-800'}`}>Your library is empty</h3>
-                <p className={`mb-6 ${isDarkMode ? 'text-stone-400' : 'text-stone-500'}`}>Translated books will appear here automatically.</p>
+              <div className={`text-center py-20 ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'} rounded-3xl border border-dashed`}>
+                <Library className={`w-16 h-16 mx-auto mb-4 ${isDarkMode ? 'text-slate-600' : 'text-slate-400'}`} />
+                <h3 className={`text-xl font-bold mb-2 ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>Your library is empty</h3>
+                <p className={`mb-6 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Translated books will appear here automatically.</p>
                 <button 
                   onClick={() => setCurrentView('translator')}
-                  className="bg-indigo-600 text-white px-6 py-3 rounded-xl hover:bg-indigo-700 transition-colors font-bold"
+                  className="bg-blue-600 text-white px-6 py-3 rounded-xl hover:bg-blue-700 transition-colors font-bold"
                 >
                   Start Translating
                 </button>
@@ -938,7 +1196,7 @@ export default function App() {
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
                 {libraryBooks.map(book => (
-                  <div key={book.id} className={`group relative ${isDarkMode ? 'bg-stone-800 border-stone-700' : 'bg-white border-stone-200'} rounded-2xl p-6 border shadow-sm hover:shadow-md transition-all`}>
+                  <div key={book.id} className={`group relative ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'} rounded-2xl p-6 border shadow-sm hover:shadow-md transition-all`}>
                     <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity">
                       <button 
                         onClick={(e) => handleDeleteBook(book.id, e)}
@@ -948,16 +1206,16 @@ export default function App() {
                         <Trash2 className="w-4 h-4" />
                       </button>
                     </div>
-                    <div className={`w-16 h-16 rounded-xl flex items-center justify-center mb-4 ${isDarkMode ? 'bg-indigo-900/50 text-indigo-400' : 'bg-indigo-100 text-indigo-600'}`}>
+                    <div className={`w-16 h-16 rounded-xl flex items-center justify-center mb-4 ${isDarkMode ? 'bg-blue-900/50 text-blue-400' : 'bg-blue-100 text-blue-600'}`}>
                       <Book className="w-8 h-8" />
                     </div>
-                    <h3 className={`font-bold text-lg mb-1 truncate ${isDarkMode ? 'text-stone-200' : 'text-stone-800'}`} title={book.title}>{book.title}</h3>
-                    <p className={`text-sm mb-4 ${isDarkMode ? 'text-stone-400' : 'text-stone-500'}`}>
+                    <h3 className={`font-bold text-lg mb-1 truncate ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`} title={book.title}>{book.title}</h3>
+                    <p className={`text-sm mb-4 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
                       {new Date(book.date).toLocaleDateString()} • {book.sourceLang.toUpperCase()} → {book.targetLang.toUpperCase()}
                     </p>
                     <button 
                       onClick={(e) => handleDownloadBook(book, e)}
-                      className={`w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkMode ? 'bg-indigo-900/30 text-indigo-300 hover:bg-indigo-900/50' : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'}`}
+                      className={`w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkMode ? 'bg-blue-900/30 text-blue-300 hover:bg-blue-900/50' : 'bg-blue-50 text-blue-700 hover:bg-blue-100'}`}
                     >
                       <Download className="w-4 h-4" /> Download
                     </button>
@@ -966,8 +1224,10 @@ export default function App() {
               </div>
             )}
           </div>
-        ) : (
-          <>
+        )}
+
+        {currentView === 'translator' && (
+          <div className="animate-fade-in">
             {errorMsg && (
           <div className={`mb-6 border px-4 py-3 rounded-xl flex items-center gap-3 animate-fade-in ${isDarkMode ? 'bg-red-900/30 border-red-800 text-red-400' : 'bg-red-50 border-red-200 text-red-700'}`}>
             <AlertCircle className="w-5 h-5 flex-shrink-0" />
@@ -977,40 +1237,40 @@ export default function App() {
 
         {/* STEP 1: UPLOAD */}
         {step === 1 && (
-          <div className="max-w-3xl mx-auto mt-16 flex flex-col items-center gap-8 animate-slide-up">
-            <div className="text-center space-y-2">
-              <h2 className={`text-3xl font-bold tracking-tight ${isDarkMode ? 'text-stone-100' : 'text-stone-900'}`}>Translate your EPUB books</h2>
-              <p className={`text-lg ${isDarkMode ? 'text-stone-400' : 'text-stone-500'}`}>Upload an EPUB and generate a bilingual version instantly.</p>
+          <div className="max-w-3xl mx-auto mt-12 flex flex-col items-center gap-8 animate-slide-up">
+            <div className="text-center space-y-3">
+              <h2 className={`text-4xl font-extrabold tracking-tight ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>Start Translating</h2>
+              <p className={`text-lg ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Upload your EPUB file to begin the magic.</p>
             </div>
 
             <div 
               onDragOver={(e) => e.preventDefault()} 
               onDrop={(e) => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }}
-              className={`w-full border-2 border-dashed rounded-3xl p-16 flex flex-col items-center justify-center text-center transition-all cursor-pointer shadow-sm group ${isDarkMode ? 'border-indigo-500/30 bg-indigo-900/20 hover:bg-indigo-900/30 hover:border-indigo-500/50' : 'border-indigo-200 bg-indigo-50/50 hover:bg-indigo-50 hover:border-indigo-400'}`}
+              className={`w-full border-2 border-dashed rounded-[2rem] p-16 flex flex-col items-center justify-center text-center transition-all cursor-pointer shadow-sm group ${isDarkMode ? 'border-blue-500/30 bg-blue-900/10 hover:bg-blue-900/20 hover:border-blue-500/50' : 'border-blue-200 bg-blue-50/30 hover:bg-blue-50/80 hover:border-blue-400'}`}
               onClick={() => document.getElementById('file-upload')?.click()}
             >
-              <div className={`p-5 rounded-2xl shadow-sm mb-6 group-hover:scale-110 transition-transform duration-300 ${isDarkMode ? 'bg-stone-800' : 'bg-white'}`}>
-                <UploadCloud className="w-10 h-10 text-indigo-600" />
+              <div className={`p-6 rounded-2xl shadow-sm mb-6 group-hover:scale-110 group-hover:-translate-y-2 transition-all duration-300 ${isDarkMode ? 'bg-slate-800 text-blue-400' : 'bg-white text-blue-600'}`}>
+                <UploadCloud className="w-12 h-12" />
               </div>
-              <h3 className={`text-xl font-semibold mb-2 ${isDarkMode ? 'text-stone-200' : 'text-stone-800'}`}>Click or drag file to this area to upload</h3>
-              <p className={`mb-8 max-w-sm ${isDarkMode ? 'text-stone-400' : 'text-stone-500'}`}>Support for a single EPUB upload. Your file is processed locally in your browser.</p>
-              <button className="bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-3 rounded-xl font-medium transition-all shadow-sm hover:shadow-md">
+              <h3 className={`text-2xl font-bold mb-3 ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>Click or drag file to this area</h3>
+              <p className={`mb-8 max-w-sm text-sm ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Support for a single EPUB upload. Your file is processed securely.</p>
+              <button className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white px-8 py-4 rounded-full font-bold transition-all shadow-md hover:shadow-lg">
                 Select EPUB File
               </button>
               <input id="file-upload" type="file" accept=".epub" className="hidden" onChange={(e) => e.target.files && handleFile(e.target.files[0])} />
             </div>
             
-            <div className={`flex items-center gap-4 w-full max-w-md ${isDarkMode ? 'opacity-40' : 'opacity-60'}`}>
-              <div className={`h-px flex-1 ${isDarkMode ? 'bg-stone-600' : 'bg-stone-300'}`}></div>
-              <span className={`font-medium text-xs uppercase tracking-widest ${isDarkMode ? 'text-stone-400' : 'text-stone-500'}`}>OR TRY A SAMPLE</span>
-              <div className={`h-px flex-1 ${isDarkMode ? 'bg-stone-600' : 'bg-stone-300'}`}></div>
+            <div className={`flex items-center gap-4 w-full max-w-md opacity-60`}>
+              <div className={`h-px flex-1 ${isDarkMode ? 'bg-slate-700' : 'bg-slate-300'}`}></div>
+              <span className={`font-semibold text-xs uppercase tracking-widest ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>OR TRY A SAMPLE</span>
+              <div className={`h-px flex-1 ${isDarkMode ? 'bg-slate-700' : 'bg-slate-300'}`}></div>
             </div>
             
             <button 
               onClick={handleTrySample}
-              className={`flex items-center gap-2 border px-6 py-3 rounded-xl font-medium transition-all shadow-sm ${isDarkMode ? 'bg-stone-800 border-stone-700 text-stone-300 hover:bg-stone-700 hover:text-stone-100' : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50 hover:text-stone-900'}`}
+              className={`flex items-center gap-2 px-6 py-3 rounded-full font-medium transition-all ${isDarkMode ? 'bg-slate-800 text-slate-300 hover:bg-slate-700 border border-slate-700' : 'bg-white text-slate-700 hover:bg-slate-50 border border-slate-200 shadow-sm'}`}
             >
-              <BookOpen className="w-5 h-5 text-indigo-500" />
+              <BookOpen className="w-5 h-5 text-blue-500" />
               Use Moby Dick Sample
             </button>
           </div>
@@ -1020,65 +1280,65 @@ export default function App() {
         {step === 2 && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 animate-slide-up">
             <div className="lg:col-span-8 space-y-6">
-              <div className={`p-8 rounded-3xl shadow-sm border ${isDarkMode ? 'bg-stone-800 border-stone-700' : 'bg-white border-stone-200'}`}>
-                <div className={`flex items-center justify-between mb-6 pb-4 border-b ${isDarkMode ? 'border-stone-700' : 'border-stone-100'}`}>
+              <div className={`p-8 rounded-3xl shadow-sm border ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+                <div className={`flex items-center justify-between mb-6 pb-4 border-b ${isDarkMode ? 'border-slate-700' : 'border-slate-100'}`}>
                   <div className="flex items-center gap-3">
-                    <div className={`p-2 rounded-lg ${isDarkMode ? 'bg-indigo-900/50' : 'bg-indigo-100'}`}>
-                      <Settings className={`w-5 h-5 ${isDarkMode ? 'text-indigo-400' : 'text-indigo-600'}`}/>
+                    <div className={`p-2 rounded-lg ${isDarkMode ? 'bg-blue-900/50' : 'bg-blue-100'}`}>
+                      <Settings className={`w-5 h-5 ${isDarkMode ? 'text-blue-400' : 'text-blue-600'}`}/>
                     </div>
-                    <h2 className={`text-xl font-bold ${isDarkMode ? 'text-stone-100' : 'text-stone-800'}`}>Translation Settings</h2>
+                    <h2 className={`text-xl font-bold ${isDarkMode ? 'text-slate-100' : 'text-slate-800'}`}>Translation Settings</h2>
                   </div>
-                  <button onClick={handleReset} className={`text-sm font-medium flex items-center gap-1.5 transition-colors px-3 py-1.5 rounded-lg border ${isDarkMode ? 'text-stone-300 hover:text-stone-100 bg-stone-800 border-stone-700 hover:bg-stone-700' : 'text-stone-500 hover:text-stone-800 bg-white border-stone-200 hover:bg-stone-50'}`}>
+                  <button onClick={handleReset} className={`text-sm font-medium flex items-center gap-1.5 transition-colors px-3 py-1.5 rounded-lg border ${isDarkMode ? 'text-slate-300 hover:text-slate-100 bg-slate-800 border-slate-700 hover:bg-slate-700' : 'text-slate-500 hover:text-slate-800 bg-white border-slate-200 hover:bg-slate-50'}`}>
                     <ArrowLeft className="w-4 h-4" /> Change File
                   </button>
                 </div>
                 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                   <div className="space-y-2">
-                    <label className={`block text-sm font-semibold ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Source Language</label>
+                    <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Source Language</label>
                     <div className="relative">
                       <select 
                         value={config.sourceLang} 
                         onChange={e => setConfig({...config, sourceLang: e.target.value})}
-                        className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all ${isDarkMode ? 'bg-stone-900 border-stone-700 text-white' : 'bg-stone-50 border-stone-300 focus:bg-white'}`}
+                        className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-900 border-slate-700 text-white' : 'bg-slate-50 border-slate-300 focus:bg-white'}`}
                       >
                         {LANGUAGES.map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
                       </select>
-                      <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-stone-500">
+                      <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
                         <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
                       </div>
                     </div>
                   </div>
 
                   <div className="space-y-2">
-                    <label className={`block text-sm font-semibold ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Target Language</label>
+                    <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Target Language</label>
                     <div className="relative">
                       <select 
                         value={config.targetLang} 
                         onChange={e => setConfig({...config, targetLang: e.target.value})}
-                        className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all ${isDarkMode ? 'bg-stone-900 border-stone-700 text-white' : 'bg-stone-50 border-stone-300 focus:bg-white'}`}
+                        className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-900 border-slate-700 text-white' : 'bg-slate-50 border-slate-300 focus:bg-white'}`}
                       >
                         {LANGUAGES.filter(l => l.code !== 'auto').map(l => <option key={l.code} value={l.code}>{l.name}</option>)}
                       </select>
-                      <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-stone-500">
+                      <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
                         <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
                       </div>
                     </div>
                   </div>
                   
                   <div className="space-y-2">
-                    <label className={`block text-sm font-semibold ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Translation Engine</label>
+                    <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Translation Engine</label>
                     <div className="relative">
                       <select 
                         value={config.engine} 
                         onChange={e => setConfig({...config, engine: e.target.value as EngineType})}
-                        className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all ${isDarkMode ? 'bg-stone-900 border-stone-700 text-white' : 'bg-stone-50 border-stone-300 focus:bg-white'}`}
+                        className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-900 border-slate-700 text-white' : 'bg-slate-50 border-slate-300 focus:bg-white'}`}
                       >
                         <option value="gtx">Google Translate (Free)</option>
                         <option value="gtx-fallback">Google Translate (Free) + Gemini Backup</option>
                         <option value="gemini">Gemini AI (API Key)</option>
                       </select>
-                      <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-stone-500">
+                      <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
                         <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
                       </div>
                     </div>
@@ -1087,38 +1347,38 @@ export default function App() {
                   {(config.engine === 'gemini' || config.engine === 'gtx-fallback') && (
                     <>
                       <div className="md:col-span-1 space-y-2 animate-fade-in">
-                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Gemini Model</label>
+                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Gemini Model</label>
                         <div className="relative">
                           <select 
                             value={config.geminiModel} 
                             onChange={e => setConfig({...config, geminiModel: e.target.value})}
-                            className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all ${isDarkMode ? 'bg-stone-900 border-stone-700 text-white' : 'bg-stone-50 border-stone-300 focus:bg-white'}`}
+                            className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-900 border-slate-700 text-white' : 'bg-slate-50 border-slate-300 focus:bg-white'}`}
                           >
                             <option value="gemini-3-flash-preview">Gemini 3 Flash (Fast & Cheap)</option>
                             <option value="gemini-3.1-flash-lite-preview">Gemini 3.1 Flash-Lite (Cheapest)</option>
                             <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro (High Quality)</option>
                           </select>
-                          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-stone-500">
+                          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
                             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
                           </div>
                         </div>
                       </div>
                       <div className="md:col-span-1 space-y-2 animate-fade-in">
-                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Gemini API Key</label>
+                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Gemini API Key</label>
                         <input 
                           type="password" 
                           value={config.apiKey}
                           onChange={e => setConfig({...config, apiKey: e.target.value})}
                           placeholder="Enter your API key..."
-                          className={`w-full border rounded-xl px-4 py-3 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all ${isDarkMode ? 'bg-stone-900 border-stone-700 text-white placeholder-stone-500' : 'bg-stone-50 border-stone-300 focus:bg-white placeholder-stone-400'}`}
+                          className={`w-full border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-900 border-slate-700 text-white placeholder-slate-500' : 'bg-slate-50 border-slate-300 focus:bg-white placeholder-slate-400'}`}
                         />
-                        <p className={`text-xs ${isDarkMode ? 'text-stone-500' : 'text-stone-500'}`}>Your key is only used locally and never stored.</p>
+                        <p className={`text-xs ${isDarkMode ? 'text-slate-500' : 'text-slate-500'}`}>Your key is only used locally and never stored.</p>
                       </div>
                     </>
                   )}
 
                   <div className="md:col-span-2 space-y-3">
-                    <label className={`block text-sm font-semibold ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Layout Style</label>
+                    <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Layout Style</label>
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                       {[
                         { id: 'side-by-side', name: 'Side by Side', desc: 'Original left, translation right', icon: Layout },
@@ -1128,14 +1388,14 @@ export default function App() {
                         <button
                           key={l.id}
                           onClick={() => setConfig({...config, layout: l.id as LayoutType})}
-                          className={`flex flex-col items-start text-left gap-3 p-5 rounded-2xl border-2 transition-all ${config.layout === l.id ? (isDarkMode ? 'border-indigo-500 bg-indigo-900/30 shadow-sm' : 'border-indigo-600 bg-indigo-50/50 shadow-sm') : isDarkMode ? 'border-stone-700 bg-stone-900 hover:border-stone-600' : 'border-stone-200 bg-white hover:border-stone-300 hover:bg-stone-50'}`}
+                          className={`flex flex-col items-start text-left gap-3 p-5 rounded-2xl border-2 transition-all ${config.layout === l.id ? (isDarkMode ? 'border-blue-500 bg-blue-900/30 shadow-sm' : 'border-blue-600 bg-blue-50/50 shadow-sm') : isDarkMode ? 'border-slate-700 bg-slate-900 hover:border-slate-600' : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50'}`}
                         >
-                          <div className={`p-2 rounded-lg ${config.layout === l.id ? (isDarkMode ? 'bg-indigo-600 text-white' : 'bg-indigo-600 text-white') : isDarkMode ? 'bg-stone-800 text-stone-400' : 'bg-stone-100 text-stone-600'}`}>
+                          <div className={`p-2 rounded-lg ${config.layout === l.id ? (isDarkMode ? 'bg-blue-600 text-white' : 'bg-blue-600 text-white') : isDarkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-600'}`}>
                             <l.icon className="w-5 h-5" />
                           </div>
                           <div>
-                            <div className={`font-semibold ${config.layout === l.id ? (isDarkMode ? 'text-indigo-300' : 'text-indigo-900') : isDarkMode ? 'text-stone-200' : 'text-stone-800'}`}>{l.name}</div>
-                            <div className={`text-xs mt-1 ${config.layout === l.id ? (isDarkMode ? 'text-indigo-400/70' : 'text-indigo-700/70') : isDarkMode ? 'text-stone-500' : 'text-stone-500'}`}>{l.desc}</div>
+                            <div className={`font-semibold ${config.layout === l.id ? (isDarkMode ? 'text-blue-300' : 'text-blue-900') : isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>{l.name}</div>
+                            <div className={`text-xs mt-1 ${config.layout === l.id ? (isDarkMode ? 'text-blue-400/70' : 'text-blue-700/70') : isDarkMode ? 'text-slate-500' : 'text-slate-500'}`}>{l.desc}</div>
                           </div>
                         </button>
                       ))}
@@ -1143,35 +1403,35 @@ export default function App() {
                   </div>
 
                   {config.layout === 'interlinear' && (
-                    <div className={`md:col-span-2 flex gap-6 p-5 rounded-2xl border animate-fade-in ${isDarkMode ? 'bg-stone-900 border-stone-700' : 'bg-stone-50 border-stone-200'}`}>
+                    <div className={`md:col-span-2 flex gap-6 p-5 rounded-2xl border animate-fade-in ${isDarkMode ? 'bg-slate-900 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
                       <div className="flex-1">
-                        <label className={`block text-xs font-semibold mb-2 uppercase tracking-wider ${isDarkMode ? 'text-stone-400' : 'text-stone-600'}`}>Translation Background</label>
+                        <label className={`block text-xs font-semibold mb-2 uppercase tracking-wider ${isDarkMode ? 'text-slate-400' : 'text-slate-600'}`}>Translation Background</label>
                         <div className="flex items-center gap-3">
-                          <input type="color" value={config.customBg} onChange={e => setConfig({...config, customBg: e.target.value})} className={`h-10 w-10 rounded cursor-pointer border-0 p-0 ${isDarkMode ? 'bg-stone-800' : ''}`} />
-                          <span className={`text-sm font-mono ${isDarkMode ? 'text-stone-400' : 'text-stone-500'}`}>{config.customBg}</span>
+                          <input type="color" value={config.customBg} onChange={e => setConfig({...config, customBg: e.target.value})} className={`h-10 w-10 rounded cursor-pointer border-0 p-0 ${isDarkMode ? 'bg-slate-800' : ''}`} />
+                          <span className={`text-sm font-mono ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>{config.customBg}</span>
                         </div>
                       </div>
                       <div className="flex-1">
-                        <label className={`block text-xs font-semibold mb-2 uppercase tracking-wider ${isDarkMode ? 'text-stone-400' : 'text-stone-600'}`}>Translation Text</label>
+                        <label className={`block text-xs font-semibold mb-2 uppercase tracking-wider ${isDarkMode ? 'text-slate-400' : 'text-slate-600'}`}>Translation Text</label>
                         <div className="flex items-center gap-3">
-                          <input type="color" value={config.customColor} onChange={e => setConfig({...config, customColor: e.target.value})} className={`h-10 w-10 rounded cursor-pointer border-0 p-0 ${isDarkMode ? 'bg-stone-800' : ''}`} />
-                          <span className={`text-sm font-mono ${isDarkMode ? 'text-stone-400' : 'text-stone-500'}`}>{config.customColor}</span>
+                          <input type="color" value={config.customColor} onChange={e => setConfig({...config, customColor: e.target.value})} className={`h-10 w-10 rounded cursor-pointer border-0 p-0 ${isDarkMode ? 'bg-slate-800' : ''}`} />
+                          <span className={`text-sm font-mono ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>{config.customColor}</span>
                         </div>
                       </div>
                     </div>
                   )}
 
                   {/* Advanced Translation Settings */}
-                  <div className={`md:col-span-2 p-6 rounded-2xl border shadow-sm ${isDarkMode ? 'bg-stone-900/50 border-stone-700' : 'bg-stone-50 border-stone-200'}`}>
-                    <h3 className={`text-lg font-bold mb-4 ${isDarkMode ? 'text-stone-200' : 'text-stone-800'}`}>Advanced Translation</h3>
+                  <div className={`md:col-span-2 p-6 rounded-2xl border shadow-sm ${isDarkMode ? 'bg-slate-900/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
+                    <h3 className={`text-lg font-bold mb-4 ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>Advanced Translation</h3>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                       <div className="space-y-2">
-                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Translation Tone</label>
+                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Translation Tone</label>
                         <div className="relative">
                           <select 
                             value={config.tone} 
                             onChange={e => setConfig({...config, tone: e.target.value as any})}
-                            className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all ${isDarkMode ? 'bg-stone-800 border-stone-600 text-white' : 'bg-white border-stone-300 focus:bg-white'}`}
+                            className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-800 border-slate-600 text-white' : 'bg-white border-slate-300 focus:bg-white'}`}
                           >
                             <option value="default">Default (Auto)</option>
                             <option value="formal">Formal</option>
@@ -1179,77 +1439,77 @@ export default function App() {
                             <option value="literary">Literary</option>
                             <option value="simple">Simple (For Kids/Learners)</option>
                           </select>
-                          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-stone-500">
+                          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
                             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
                           </div>
                         </div>
                       </div>
                       <div className="space-y-2 md:col-span-2">
-                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Custom Glossary (Optional)</label>
-                        <p className={`text-xs mb-2 ${isDarkMode ? 'text-stone-400' : 'text-stone-500'}`}>Add specific translation rules. Example: <code className="bg-stone-200 dark:bg-stone-700 px-1 rounded">Muggle: Muggle</code></p>
+                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Custom Glossary (Optional)</label>
+                        <p className={`text-xs mb-2 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Add specific translation rules. Example: <code className="bg-slate-200 dark:bg-slate-700 px-1 rounded">Muggle: Muggle</code></p>
                         <textarea 
                           value={config.customGlossary}
                           onChange={e => setConfig({...config, customGlossary: e.target.value})}
                           placeholder="Hogwarts: Hogwarts&#10;Quidditch: Quidditch"
-                          className={`w-full border rounded-xl px-4 py-3 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all min-h-[100px] ${isDarkMode ? 'bg-stone-800 border-stone-600 text-white placeholder-stone-500' : 'bg-white border-stone-300 placeholder-stone-400'}`}
+                          className={`w-full border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all min-h-[100px] ${isDarkMode ? 'bg-slate-800 border-slate-600 text-white placeholder-slate-500' : 'bg-white border-slate-300 placeholder-slate-400'}`}
                         />
                       </div>
                     </div>
                   </div>
 
                   {/* Appearance Settings */}
-                  <div className={`md:col-span-2 p-6 rounded-2xl border shadow-sm ${isDarkMode ? 'bg-stone-900/50 border-stone-700' : 'bg-stone-50 border-stone-200'}`}>
-                    <h3 className={`text-lg font-bold mb-4 ${isDarkMode ? 'text-stone-200' : 'text-stone-800'}`}>Output Appearance</h3>
+                  <div className={`md:col-span-2 p-6 rounded-2xl border shadow-sm ${isDarkMode ? 'bg-slate-900/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
+                    <h3 className={`text-lg font-bold mb-4 ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>Output Appearance</h3>
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-6">
                       <div className="space-y-2">
-                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Font Family</label>
+                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Font Family</label>
                         <div className="relative">
                           <select 
                             value={config.fontFamily} 
                             onChange={e => setConfig({...config, fontFamily: e.target.value})}
-                            className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all ${isDarkMode ? 'bg-stone-800 border-stone-600 text-white' : 'bg-white border-stone-300 focus:bg-white'}`}
+                            className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-800 border-slate-600 text-white' : 'bg-white border-slate-300 focus:bg-white'}`}
                           >
                             <option value="sans-serif">Sans-serif</option>
                             <option value="serif">Serif</option>
                             <option value="monospace">Monospace</option>
                           </select>
-                          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-stone-500">
+                          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
                             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
                           </div>
                         </div>
                       </div>
                       <div className="space-y-2">
-                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Font Size</label>
+                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Font Size</label>
                         <div className="relative">
                           <select 
                             value={config.fontSize} 
                             onChange={e => setConfig({...config, fontSize: e.target.value})}
-                            className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all ${isDarkMode ? 'bg-stone-800 border-stone-600 text-white' : 'bg-white border-stone-300 focus:bg-white'}`}
+                            className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-800 border-slate-600 text-white' : 'bg-white border-slate-300 focus:bg-white'}`}
                           >
                             <option value="0.9em">Small</option>
                             <option value="1em">Medium</option>
                             <option value="1.2em">Large</option>
                             <option value="1.5em">Extra Large</option>
                           </select>
-                          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-stone-500">
+                          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
                             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
                           </div>
                         </div>
                       </div>
                       <div className="space-y-2">
-                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Line Spacing</label>
+                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Line Spacing</label>
                         <div className="relative">
                           <select 
                             value={config.lineSpacing} 
                             onChange={e => setConfig({...config, lineSpacing: e.target.value})}
-                            className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all ${isDarkMode ? 'bg-stone-800 border-stone-600 text-white' : 'bg-white border-stone-300 focus:bg-white'}`}
+                            className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-800 border-slate-600 text-white' : 'bg-white border-slate-300 focus:bg-white'}`}
                           >
                             <option value="1.2">Tight</option>
                             <option value="1.5">Normal</option>
                             <option value="1.8">Relaxed</option>
                             <option value="2.0">Loose</option>
                           </select>
-                          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-stone-500">
+                          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
                             <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
                           </div>
                         </div>
@@ -1265,7 +1525,7 @@ export default function App() {
                           id="glossary" 
                           checked={config.buildGlossary} 
                           onChange={e => setConfig({...config, buildGlossary: e.target.checked})}
-                          className={`w-5 h-5 rounded cursor-pointer ${isDarkMode ? 'text-emerald-500 border-emerald-700 focus:ring-emerald-500 bg-stone-800' : 'text-emerald-600 border-emerald-300 focus:ring-emerald-500'}`}
+                          className={`w-5 h-5 rounded cursor-pointer ${isDarkMode ? 'text-emerald-500 border-emerald-700 focus:ring-emerald-500 bg-slate-800' : 'text-emerald-600 border-emerald-300 focus:ring-emerald-500'}`}
                         />
                       </div>
                       <div className="flex-1">
@@ -1284,7 +1544,7 @@ export default function App() {
                             <select 
                               value={config.minCefrLevel} 
                               onChange={e => setConfig({...config, minCefrLevel: e.target.value as any})}
-                              className={`w-full appearance-none border rounded-xl px-4 py-2.5 focus:ring-2 outline-none text-sm shadow-sm ${isDarkMode ? 'bg-stone-900 border-emerald-700/50 text-stone-200 focus:ring-emerald-500' : 'bg-white border-emerald-200 text-emerald-900 focus:ring-emerald-500'}`}
+                              className={`w-full appearance-none border rounded-xl px-4 py-2.5 focus:ring-2 outline-none text-sm shadow-sm ${isDarkMode ? 'bg-slate-900 border-emerald-700/50 text-slate-200 focus:ring-emerald-500' : 'bg-white border-emerald-200 text-emerald-900 focus:ring-emerald-500'}`}
                             >
                               <option value="A1">A1-A2 (Include basic words)</option>
                               <option value="B1">B1-B2 (Intermediate words only)</option>
@@ -1303,7 +1563,7 @@ export default function App() {
                                 type="checkbox" 
                                 checked={config.extractIdioms} 
                                 onChange={e => setConfig({...config, extractIdioms: e.target.checked})}
-                                className={`w-4 h-4 rounded ${isDarkMode ? 'text-emerald-500 border-emerald-700 focus:ring-emerald-500 bg-stone-800' : 'text-emerald-600 border-emerald-300 focus:ring-emerald-500'}`}
+                                className={`w-4 h-4 rounded ${isDarkMode ? 'text-emerald-500 border-emerald-700 focus:ring-emerald-500 bg-slate-800' : 'text-emerald-600 border-emerald-300 focus:ring-emerald-500'}`}
                               />
                             </div>
                             <div>
@@ -1318,7 +1578,7 @@ export default function App() {
                                 type="checkbox" 
                                 checked={config.contextualGlossary} 
                                 onChange={e => setConfig({...config, contextualGlossary: e.target.checked})}
-                                className={`w-4 h-4 rounded ${isDarkMode ? 'text-emerald-500 border-emerald-700 focus:ring-emerald-500 bg-stone-800' : 'text-emerald-600 border-emerald-300 focus:ring-emerald-500'}`}
+                                className={`w-4 h-4 rounded ${isDarkMode ? 'text-emerald-500 border-emerald-700 focus:ring-emerald-500 bg-slate-800' : 'text-emerald-600 border-emerald-300 focus:ring-emerald-500'}`}
                               />
                             </div>
                             <div>
@@ -1335,38 +1595,38 @@ export default function App() {
             </div>
 
             <div className="lg:col-span-4 space-y-6">
-              <div className={`p-6 rounded-3xl shadow-sm border max-h-[800px] flex flex-col sticky top-24 ${isDarkMode ? 'bg-stone-800 border-stone-700' : 'bg-white border-stone-200'}`}>
-                <div className={`flex items-center justify-between mb-4 pb-4 border-b ${isDarkMode ? 'border-stone-700' : 'border-stone-100'}`}>
-                  <h2 className={`text-lg font-bold flex items-center gap-2 ${isDarkMode ? 'text-stone-200' : 'text-stone-800'}`}>
-                    <Book className="w-5 h-5 text-indigo-500"/> 
+              <div className={`p-6 rounded-3xl shadow-sm border max-h-[800px] flex flex-col sticky top-24 ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+                <div className={`flex items-center justify-between mb-4 pb-4 border-b ${isDarkMode ? 'border-slate-700' : 'border-slate-100'}`}>
+                  <h2 className={`text-lg font-bold flex items-center gap-2 ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>
+                    <Book className="w-5 h-5 text-blue-500"/> 
                     Chapters
                   </h2>
-                  <span className={`text-xs font-bold px-2.5 py-1 rounded-full ${isDarkMode ? 'bg-indigo-900/50 text-indigo-300' : 'bg-indigo-100 text-indigo-700'}`}>
+                  <span className={`text-xs font-bold px-2.5 py-1 rounded-full ${isDarkMode ? 'bg-blue-900/50 text-blue-300' : 'bg-blue-100 text-blue-700'}`}>
                     {chapters.filter(c => c.selected).length} selected
                   </span>
                 </div>
                 
                 <div className="overflow-y-auto flex-1 pr-2 space-y-1.5 custom-scrollbar">
                   {chapters.map(ch => (
-                    <label key={ch.id} className={`flex items-start gap-3 p-3 rounded-xl border transition-all cursor-pointer ${ch.selected ? (isDarkMode ? 'bg-indigo-900/30 border-indigo-700/50' : 'bg-indigo-50/50 border-indigo-200') : (isDarkMode ? 'bg-stone-800 border-transparent hover:bg-stone-700 hover:border-stone-600' : 'bg-white border-transparent hover:bg-stone-50 hover:border-stone-200')}`}>
+                    <label key={ch.id} className={`flex items-start gap-3 p-3 rounded-xl border transition-all cursor-pointer ${ch.selected ? (isDarkMode ? 'bg-blue-900/30 border-blue-700/50' : 'bg-blue-50/50 border-blue-200') : (isDarkMode ? 'bg-slate-800 border-transparent hover:bg-slate-700 hover:border-slate-600' : 'bg-white border-transparent hover:bg-slate-50 hover:border-slate-200')}`}>
                       <div className="flex items-center h-5 mt-0.5">
                         <input 
                           type="checkbox" 
                           checked={ch.selected}
                           onChange={e => setChapters(prev => prev.map(c => c.id === ch.id ? {...c, selected: e.target.checked} : c))}
-                          className={`w-4 h-4 rounded focus:ring-indigo-500 ${isDarkMode ? 'text-indigo-500 border-stone-600 bg-stone-700' : 'text-indigo-600 border-stone-300'}`}
+                          className={`w-4 h-4 rounded focus:ring-blue-500 ${isDarkMode ? 'text-blue-500 border-slate-600 bg-slate-700' : 'text-blue-600 border-slate-300'}`}
                         />
                       </div>
-                      <span className={`text-sm line-clamp-2 ${ch.selected ? (isDarkMode ? 'text-indigo-300 font-medium' : 'text-indigo-900 font-medium') : (isDarkMode ? 'text-stone-400' : 'text-stone-600')}`}>{ch.title}</span>
+                      <span className={`text-sm line-clamp-2 ${ch.selected ? (isDarkMode ? 'text-blue-300 font-medium' : 'text-blue-900 font-medium') : (isDarkMode ? 'text-slate-400' : 'text-slate-600')}`}>{ch.title}</span>
                     </label>
                   ))}
                 </div>
 
-                <div className={`pt-6 mt-4 border-t ${isDarkMode ? 'border-stone-700' : 'border-stone-100'}`}>
+                <div className={`pt-6 mt-4 border-t ${isDarkMode ? 'border-slate-700' : 'border-slate-100'}`}>
                   <button 
                     onClick={processBook}
                     disabled={chapters.filter(c => c.selected).length === 0}
-                    className={`w-full font-bold py-4 px-4 rounded-2xl transition-all shadow-sm hover:shadow flex items-center justify-center gap-2 text-lg disabled:cursor-not-allowed ${isDarkMode ? 'bg-indigo-600 hover:bg-indigo-500 disabled:bg-stone-800 disabled:text-stone-600 disabled:border disabled:border-stone-700 text-white' : 'bg-indigo-600 hover:bg-indigo-700 disabled:bg-stone-100 disabled:text-stone-400 text-white'}`}
+                    className={`w-full font-bold py-4 px-4 rounded-2xl transition-all shadow-sm hover:shadow flex items-center justify-center gap-2 text-lg disabled:cursor-not-allowed ${isDarkMode ? 'bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 disabled:border disabled:border-slate-700 text-white' : 'bg-blue-600 hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-400 text-white'}`}
                   >
                     <Play className="w-5 h-5" />
                     Start Translation
@@ -1377,83 +1637,82 @@ export default function App() {
           </div>
         )}
 
-        {/* STEP 3: PROCESSING */}
-        {step === 3 && (
-          <div className={`max-w-2xl mx-auto mt-20 p-12 rounded-[2rem] shadow-lg border text-center animate-slide-up ${isDarkMode ? 'bg-stone-800 border-stone-700 shadow-black/20' : 'bg-white border-stone-100 shadow-stone-200/50'}`}>
-            <div className="relative w-32 h-32 mx-auto mb-10">
-              <svg className="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
-                <circle cx="50" cy="50" r="45" fill="none" stroke={isDarkMode ? "#292524" : "#f5f5f4"} strokeWidth="6" />
-                <circle 
-                  cx="50" cy="50" r="45" fill="none" stroke="#4f46e5" strokeWidth="6" 
-                  strokeLinecap="round"
-                  strokeDasharray={`${2 * Math.PI * 45}`} 
-                  strokeDashoffset={`${2 * Math.PI * 45 * (1 - progress.current / Math.max(1, progress.total))}`} 
-                  className="transition-all duration-700 ease-out"
-                />
-              </svg>
-              <div className="absolute inset-0 flex items-center justify-center flex-col">
-                <span className={`text-3xl font-black tracking-tight ${isDarkMode ? 'text-indigo-400' : 'text-indigo-600'}`}>
-                  {Math.round((progress.current / Math.max(1, progress.total)) * 100)}<span className="text-lg">%</span>
-                </span>
-              </div>
-              {!isPaused && (
-                <div className="absolute inset-0 rounded-full border-4 border-indigo-500/20 animate-ping" style={{ animationDuration: '3s' }}></div>
-              )}
-            </div>
-            
-            <h2 className={`text-3xl font-bold mb-3 tracking-tight ${isDarkMode ? 'text-stone-100' : 'text-stone-900'}`}>
-              {isPaused ? 'Translation Paused' : 'Translating Book...'}
-            </h2>
-            <p className={`mb-10 max-w-md mx-auto truncate text-lg ${isDarkMode ? 'text-stone-400' : 'text-stone-500'}`}>
-              {isPaused ? 'Click resume to continue.' : progress.chapterTitle}
-            </p>
-            
-            <div className="flex justify-center gap-4">
-              {isPaused ? (
-                <button onClick={handleResume} className="flex items-center gap-2 bg-indigo-600 text-white px-8 py-4 rounded-2xl font-bold hover:bg-indigo-700 transition-all shadow-md hover:shadow-lg">
-                  <Play className="w-5 h-5" fill="currentColor" /> Resume Translation
-                </button>
-              ) : (
-                <button onClick={handlePause} className={`flex items-center gap-2 px-8 py-4 rounded-2xl font-bold transition-all ${isDarkMode ? 'bg-stone-700 text-stone-300 hover:bg-stone-600' : 'bg-stone-100 text-stone-700 hover:bg-stone-200'}`}>
-                  <Pause className="w-5 h-5" fill="currentColor" /> Pause
-                </button>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* STEP 4: DONE & PREVIEW */}
-        {step === 4 && (
+        {/* STEP 3 & 4: PROCESSING & PREVIEW */}
+        {(step === 3 || step === 4) && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 h-[calc(100vh-140px)] animate-slide-up">
             <div className="lg:col-span-3 flex flex-col gap-6">
-              <div className={`p-8 rounded-3xl shadow-md text-center relative overflow-hidden ${isDarkMode ? 'bg-gradient-to-br from-indigo-900 to-purple-900 text-stone-100' : 'bg-gradient-to-br from-indigo-600 to-purple-700 text-white'}`}>
-                <div className="absolute top-0 right-0 -mt-4 -mr-4 w-24 h-24 bg-white/10 rounded-full blur-2xl"></div>
-                <div className="absolute bottom-0 left-0 -mb-4 -ml-4 w-24 h-24 bg-black/10 rounded-full blur-2xl"></div>
-                
-                <div className="w-16 h-16 bg-white/20 backdrop-blur-sm rounded-full flex items-center justify-center mx-auto mb-5 relative z-10">
-                  <CheckCircle className="w-8 h-8 text-white" />
+              {step === 3 ? (
+                <div className={`p-8 rounded-3xl shadow-md text-center relative overflow-hidden ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'} border`}>
+                  <div className="relative w-24 h-24 mx-auto mb-6">
+                    <svg className="w-full h-full transform -rotate-90" viewBox="0 0 100 100">
+                      <circle cx="50" cy="50" r="45" fill="none" stroke={isDarkMode ? "#334155" : "#f1f5f9"} strokeWidth="6" />
+                      <circle 
+                        cx="50" cy="50" r="45" fill="none" stroke="#2563eb" strokeWidth="6" 
+                        strokeLinecap="round"
+                        strokeDasharray={`${2 * Math.PI * 45}`} 
+                        strokeDashoffset={`${2 * Math.PI * 45 * (1 - progress.current / Math.max(1, progress.total))}`} 
+                        className="transition-all duration-700 ease-out"
+                      />
+                    </svg>
+                    <div className="absolute inset-0 flex items-center justify-center flex-col">
+                      <span className={`text-xl font-black tracking-tight ${isDarkMode ? 'text-blue-400' : 'text-blue-600'}`}>
+                        {Math.round((progress.current / Math.max(1, progress.total)) * 100)}<span className="text-sm">%</span>
+                      </span>
+                    </div>
+                    {!isPaused && (
+                      <div className="absolute inset-0 rounded-full border-4 border-blue-500/20 animate-ping" style={{ animationDuration: '3s' }}></div>
+                    )}
+                  </div>
+                  
+                  <h2 className={`text-xl font-bold mb-2 tracking-tight ${isDarkMode ? 'text-slate-100' : 'text-slate-900'}`}>
+                    {isPaused ? 'Paused' : 'Translating...'}
+                  </h2>
+                  <p className={`mb-6 text-sm truncate ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                    {isPaused ? 'Click resume to continue.' : progress.chapterTitle}
+                  </p>
+                  
+                  <div className="flex justify-center gap-2">
+                    {isPaused ? (
+                      <button onClick={handleResume} className="w-full flex items-center justify-center gap-2 bg-blue-600 text-white px-4 py-3 rounded-xl font-bold hover:bg-blue-700 transition-all shadow-sm">
+                        <Play className="w-4 h-4" fill="currentColor" /> Resume
+                      </button>
+                    ) : (
+                      <button onClick={handlePause} className={`w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl font-bold transition-all ${isDarkMode ? 'bg-slate-700 text-slate-300 hover:bg-slate-600' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>
+                        <Pause className="w-4 h-4" fill="currentColor" /> Pause
+                      </button>
+                    )}
+                  </div>
                 </div>
-                <h2 className="text-2xl font-bold mb-2 relative z-10">Success!</h2>
-                <p className={`text-sm mb-8 relative z-10 ${isDarkMode ? 'text-indigo-200' : 'text-indigo-100'}`}>Your bilingual book is ready.</p>
-                <button 
-                  onClick={downloadEpub}
-                  className={`w-full flex items-center justify-center gap-2 px-4 py-3.5 rounded-xl font-bold transition-all shadow-sm relative z-10 ${isDarkMode ? 'bg-stone-800 text-indigo-300 hover:bg-stone-700' : 'bg-white text-indigo-700 hover:bg-indigo-50'}`}
-                >
-                  <Download className="w-5 h-5" />
-                  Download EPUB
-                </button>
-                <button 
-                  onClick={handleReset}
-                  className={`w-full flex items-center justify-center gap-2 px-4 py-3.5 rounded-xl font-bold transition-all mt-3 relative z-10 ${isDarkMode ? 'bg-indigo-800/50 text-indigo-200 hover:bg-indigo-700/50' : 'bg-indigo-700/30 text-white hover:bg-indigo-700/50'}`}
-                >
-                  <RotateCcw className="w-5 h-5" />
-                  Translate Another Book
-                </button>
-              </div>
+              ) : (
+                <div className={`p-8 rounded-3xl shadow-md text-center relative overflow-hidden ${isDarkMode ? 'bg-gradient-to-br from-blue-900 to-indigo-900 text-slate-100' : 'bg-gradient-to-br from-blue-600 to-indigo-700 text-white'}`}>
+                  <div className="absolute top-0 right-0 -mt-4 -mr-4 w-24 h-24 bg-white/10 rounded-full blur-2xl"></div>
+                  <div className="absolute bottom-0 left-0 -mb-4 -ml-4 w-24 h-24 bg-black/10 rounded-full blur-2xl"></div>
+                  
+                  <div className="w-16 h-16 bg-white/20 backdrop-blur-sm rounded-full flex items-center justify-center mx-auto mb-5 relative z-10">
+                    <CheckCircle className="w-8 h-8 text-white" />
+                  </div>
+                  <h2 className="text-2xl font-bold mb-2 relative z-10">Success!</h2>
+                  <p className={`text-sm mb-8 relative z-10 ${isDarkMode ? 'text-blue-200' : 'text-blue-100'}`}>Your bilingual book is ready.</p>
+                  <button 
+                    onClick={downloadEpub}
+                    className={`w-full flex items-center justify-center gap-2 px-4 py-3.5 rounded-xl font-bold transition-all shadow-sm relative z-10 ${isDarkMode ? 'bg-slate-800 text-blue-300 hover:bg-slate-700' : 'bg-white text-blue-700 hover:bg-blue-50'}`}
+                  >
+                    <Download className="w-5 h-5" />
+                    Download EPUB
+                  </button>
+                  <button 
+                    onClick={handleReset}
+                    className={`w-full flex items-center justify-center gap-2 px-4 py-3.5 rounded-xl font-bold transition-all mt-3 relative z-10 ${isDarkMode ? 'bg-blue-800/50 text-blue-200 hover:bg-blue-700/50' : 'bg-blue-700/30 text-white hover:bg-blue-700/50'}`}
+                  >
+                    <RotateCcw className="w-5 h-5" />
+                    Translate Another Book
+                  </button>
+                </div>
+              )}
 
-              <div className={`rounded-3xl shadow-sm border flex-1 overflow-hidden flex flex-col ${isDarkMode ? 'bg-stone-800 border-stone-700' : 'bg-white border-stone-200'}`}>
-                <div className={`p-5 border-b ${isDarkMode ? 'border-stone-700 bg-stone-800/50' : 'border-stone-100 bg-stone-50/50'}`}>
-                  <h3 className={`font-bold flex items-center gap-2 ${isDarkMode ? 'text-stone-200' : 'text-stone-800'}`}><FileText className="w-5 h-5 text-indigo-500"/> Preview Chapters</h3>
+              <div className={`rounded-3xl shadow-sm border flex-1 overflow-hidden flex flex-col ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+                <div className={`p-5 border-b ${isDarkMode ? 'border-slate-700 bg-slate-800/50' : 'border-slate-100 bg-slate-50/50'}`}>
+                  <h3 className={`font-bold flex items-center gap-2 ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}><FileText className="w-5 h-5 text-blue-500"/> Preview Chapters</h3>
                 </div>
                 <div className="overflow-y-auto p-3 flex-1 space-y-1 custom-scrollbar">
                   {Object.keys(previews).map(id => {
@@ -1463,7 +1722,7 @@ export default function App() {
                       <button
                         key={id}
                         onClick={() => setActivePreviewId(id)}
-                        className={`w-full text-left px-4 py-3 rounded-xl text-sm transition-all ${activePreviewId === id ? (isDarkMode ? 'bg-indigo-900/40 text-indigo-300 font-semibold shadow-sm border border-indigo-700/50' : 'bg-indigo-50 text-indigo-700 font-semibold shadow-sm border border-indigo-100') : (isDarkMode ? 'text-stone-400 hover:bg-stone-700 border border-transparent' : 'text-stone-600 hover:bg-stone-50 border border-transparent')}`}
+                        className={`w-full text-left px-4 py-3 rounded-xl text-sm transition-all ${activePreviewId === id ? (isDarkMode ? 'bg-blue-900/40 text-blue-300 font-semibold shadow-sm border border-blue-700/50' : 'bg-blue-50 text-blue-700 font-semibold shadow-sm border border-blue-100') : (isDarkMode ? 'text-slate-400 hover:bg-slate-700 border border-transparent' : 'text-slate-600 hover:bg-slate-50 border border-transparent')}`}
                       >
                         {title}
                       </button>
@@ -1473,46 +1732,91 @@ export default function App() {
               </div>
             </div>
 
-            <div className={`lg:col-span-9 rounded-3xl shadow-sm border overflow-hidden flex flex-col ${isDarkMode ? 'bg-stone-800 border-stone-700' : 'bg-white border-stone-200'}`}>
-              <div className={`px-6 py-4 border-b flex justify-between items-center ${isDarkMode ? 'border-stone-700 bg-stone-800/50' : 'border-stone-100 bg-stone-50/50'}`}>
+            <div className={`lg:col-span-9 rounded-3xl shadow-sm border overflow-hidden flex flex-col ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-200'}`}>
+              <div className={`px-6 py-4 border-b flex justify-between items-center ${isDarkMode ? 'border-slate-700 bg-slate-800/50' : 'border-slate-100 bg-slate-50/50'}`}>
                 <div className="flex items-center gap-3">
                   <div className="flex gap-1.5">
                     <div className="w-3 h-3 rounded-full bg-red-400"></div>
                     <div className="w-3 h-3 rounded-full bg-amber-400"></div>
                     <div className="w-3 h-3 rounded-full bg-green-400"></div>
                   </div>
-                  <span className={`font-semibold ml-2 ${isDarkMode ? 'text-stone-300' : 'text-stone-700'}`}>Live Preview</span>
+                  <span className={`font-semibold ml-2 ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Live Preview</span>
                 </div>
                 <div className="flex items-center gap-3">
                   {activePreviewId && previews[activePreviewId] && (
                     <button 
                       onClick={handleTTS}
-                      className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg transition-colors ${isSpeaking ? 'bg-red-100 text-red-600 hover:bg-red-200 dark:bg-red-900/30 dark:text-red-400 dark:hover:bg-red-900/50' : 'bg-indigo-100 text-indigo-600 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400 dark:hover:bg-indigo-900/50'}`}
+                      className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg transition-colors ${isSpeaking ? 'bg-red-100 text-red-600 hover:bg-red-200 dark:bg-red-900/30 dark:text-red-400 dark:hover:bg-red-900/50' : 'bg-blue-100 text-blue-600 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:hover:bg-blue-900/50'}`}
                     >
                       {isSpeaking ? <Square className="w-3.5 h-3.5 fill-current" /> : <Volume2 className="w-3.5 h-3.5" />}
                       {isSpeaking ? 'Stop Reading' : 'Read Aloud'}
                     </button>
                   )}
-                  <span className={`text-xs font-medium px-3 py-1 rounded-full border hidden sm:inline-block ${isDarkMode ? 'text-stone-400 bg-stone-800 border-stone-700' : 'text-stone-400 bg-white border-stone-200'}`}>Styling may differ slightly in e-readers</span>
+                  <span className={`text-xs font-medium px-3 py-1 rounded-full border hidden sm:inline-block ${isDarkMode ? 'text-slate-400 bg-slate-800 border-slate-700' : 'text-slate-400 bg-white border-slate-200'}`}>Styling may differ slightly in e-readers</span>
                 </div>
               </div>
-              <div className={`flex-1 overflow-y-auto p-10 custom-scrollbar flex justify-center ${isDarkMode ? 'bg-[#1c1917]' : 'bg-[#fdfdfc]'}`}>
+              <div className={`flex-1 overflow-y-auto p-10 custom-scrollbar flex justify-center relative ${isDarkMode ? 'bg-[#0f172a]' : 'bg-[#f8fafc]'}`}>
                 {activePreviewId && previews[activePreviewId] ? (
                   <div 
-                    className={`prose prose-lg max-w-3xl w-full ${isDarkMode ? 'prose-invert prose-stone' : 'prose-stone'}`}
+                    className={`prose prose-lg max-w-3xl w-full ${isDarkMode ? 'prose-invert prose-slate' : 'prose-slate'}`}
+                    style={{
+                      fontFamily: config.fontFamily,
+                      fontSize: config.fontSize,
+                      lineHeight: config.lineSpacing
+                    }}
+                    onMouseUp={handleTextSelection}
                     dangerouslySetInnerHTML={{ __html: previews[activePreviewId] }}
                   />
                 ) : (
-                  <div className={`h-full flex flex-col items-center justify-center space-y-4 ${isDarkMode ? 'text-stone-500' : 'text-stone-400'}`}>
+                  <div className={`h-full flex flex-col items-center justify-center space-y-4 ${isDarkMode ? 'text-slate-500' : 'text-slate-400'}`}>
                     <BookOpen className="w-12 h-12 opacity-20" />
                     <p>Select a chapter from the sidebar to preview</p>
+                  </div>
+                )}
+
+                {/* Dictionary Popup */}
+                {dictionaryWord && (
+                  <div 
+                    className={`dictionary-popup fixed z-50 p-4 rounded-xl shadow-2xl border max-w-sm w-full -translate-x-1/2 mt-2 animate-fade-in ${isDarkMode ? 'bg-slate-800 border-slate-700 text-slate-200' : 'bg-white border-slate-200 text-slate-800'}`}
+                    style={{ left: dictionaryPos.x, top: dictionaryPos.y }}
+                  >
+                    <div className="flex justify-between items-start mb-2">
+                      <h4 className="font-bold text-lg text-blue-500">{dictionaryWord}</h4>
+                      <button onClick={() => setDictionaryWord(null)} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                    
+                    {dictionaryLoading ? (
+                      <div className="flex items-center justify-center py-4">
+                        <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                      </div>
+                    ) : dictionaryData ? (
+                      <div className="space-y-3 max-h-60 overflow-y-auto custom-scrollbar pr-2">
+                        {dictionaryData.phonetics?.[0]?.text && (
+                          <p className="text-sm text-slate-500 font-mono">{dictionaryData.phonetics[0].text}</p>
+                        )}
+                        {dictionaryData.meanings?.slice(0, 2).map((meaning: any, i: number) => (
+                          <div key={i}>
+                            <span className={`text-xs font-bold uppercase tracking-wider ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>{meaning.partOfSpeech}</span>
+                            <ul className="list-disc pl-4 mt-1 space-y-1">
+                              {meaning.definitions.slice(0, 2).map((def: any, j: number) => (
+                                <li key={j} className="text-sm">{def.definition}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-sm text-slate-500 py-2">No definition found.</p>
+                    )}
                   </div>
                 )}
               </div>
             </div>
           </div>
         )}
-        </>
+          </div>
         )}
       </main>
     </div>
