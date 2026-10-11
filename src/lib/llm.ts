@@ -100,6 +100,9 @@ export async function listModels(s: LlmSettings): Promise<string[]> {
 }
 
 const MAX_BUSY_RETRIES = 4;
+
+export const stripThinking = (reply: string) =>
+  reply.replace(/<think>[\s\S]*?<\/think>|<thought>[\s\S]*?<\/thought>/g, '').trim();
 const MAX_RETRY_WAIT_MS = 65_000;
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -132,7 +135,8 @@ export async function chat(
       if ((e as Error)?.name === 'AbortError') throw e;
       throw new LlmError(describeNetworkError(s), 0);
     }
-    const busy = res.status === 429 || res.status === 503;
+    // 429: rate limit. 5xx: transient server errors (Google's endpoint returns occasional 500s).
+    const busy = res.status === 429 || res.status >= 500;
     if (!busy || attempt >= MAX_BUSY_RETRIES) break;
     await sleep(retryDelayMs(res, attempt));
   }
@@ -142,8 +146,8 @@ export async function chat(
   }
   const data = await res.json();
   const raw = data?.choices?.[0]?.message?.content;
-  // Reasoning models (Qwen 3, DeepSeek R1) may put their thinking in the reply; drop it.
-  const content = typeof raw === 'string' ? raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim() : '';
+  // Reasoning models put their thinking in the reply: <think> (Qwen 3, DeepSeek R1), <thought> (Gemma 4).
+  const content = typeof raw === 'string' ? stripThinking(raw) : '';
   if (!content) throw new LlmError('Yapay zeka boş yanıt döndürdü');
   return content;
 }

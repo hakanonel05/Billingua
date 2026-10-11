@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AppConfig } from '../types';
 import { translateBatch, simplifyBatch, chunkByChars } from './translate';
-import { parseJsonReply, mapParagraphs, LlmError, isFatal } from './llm';
+import { parseJsonReply, mapParagraphs, LlmError, isFatal, stripThinking } from './llm';
 
 const config = (overrides: Partial<AppConfig> = {}): AppConfig => ({
   sourceLang: 'en', targetLang: 'tr', layout: 'side-by-side', engine: 'gtx',
@@ -186,6 +186,11 @@ describe('simplifyBatch', () => {
 });
 
 describe('llm helpers', () => {
+  it('drops the thinking that reasoning models put in the reply', () => {
+    expect(stripThinking('<think>hmm</think>{"items":[]}')).toBe('{"items":[]}');
+    expect(stripThinking('<thought>* check\n* ok</thought>Merhaba')).toBe('Merhaba');
+  });
+
   it('parses JSON wrapped in prose or code fences', () => {
     expect(parseJsonReply('```json\n{"items":[]}\n```')).toEqual({ items: [] });
     expect(parseJsonReply('Sure! Here it is: {"items":[{"id":1,"text":"a"}]} Hope it helps.')).toEqual({ items: [{ id: 1, text: 'a' }] });
