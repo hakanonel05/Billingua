@@ -12,7 +12,7 @@
 - **Kitabın yapısı korunur.** İtalik, link, dipnot ve resimler yerinde kalır. İçindekiler çevrilmez, linkleri çalışmaya devam eder.
 - **Çeviri motorları**
   - Google Translate: ücretsiz.
-  - Açık kaynak yapay zeka: Llama, Qwen, Gemma, Mistral gibi modeller, OpenAI uyumlu her sunucu üzerinden. Önceki paragraflar ve kitaptaki karakter isimleri bağlam olarak gönderilir.
+  - Açık kaynak yapay zeka: Llama, Qwen, Gemma, Mistral gibi modeller, OpenAI uyumlu her sunucu üzerinden. Model; kitabın adını ve yazarını, karakter isimlerini ve önceki paragrafların nasıl çevrildiğini görür. Böylece isimler, terimler ve sen/siz kullanımı kitap boyunca tutarlı kalır, deyimler kelime kelime değil anlamıyla çevrilir. Kalite modele bağlıdır: 70B sınıfı modeller (ör. Groq'taki Llama 3.3 70B) Google'dan daha doğal bir edebi çeviri verir; dizüstü bilgisayarda çalışan 4B sınıfı küçük modeller genellikle Google'ın gerisinde kalır.
   - İkisinin birlikte kullanımı: Google başarısız olursa yapay zeka devreye girer.
 - **Metni sadeleştirme.** C1/C2 bir kitabın İngilizcesi yapay zeka ile B2, B1 ya da A2 seviyesinde yeniden yazılır (graded reader). Türkçe çeviri sade metinden yapılır; başlık `(EN–TR, B1)` olur.
 - **PDF olarak indirme.** EPUB'ın yanında aynı kitabın PDF'i de indirilebilir: yan yana sütunlar, resimler ve sayfa numaralarıyla. Kütüphanedeki eski kitaplar da PDF'e çevrilebilir. PDF yazı tipi Latin, Yunan ve Kiril alfabelerini kapsar; Japonca, Arapça gibi diller için EPUB kullanın.

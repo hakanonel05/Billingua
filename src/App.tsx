@@ -107,6 +107,7 @@ export default function App() {
     }
   };
   const bookNamesRef = useRef<string[]>([]);
+  const bookInfoRef = useRef<{ title?: string; author?: string }>({});
   const [pendingJob, setPendingJob] = useState<PendingJob | null>(null);
 
   useEffect(() => {
@@ -221,6 +222,8 @@ export default function App() {
       if (!opfContent) throw new Error("Invalid EPUB: Missing OPF file");
       
       const opfDoc = parser.parseFromString(opfContent, "application/xml");
+      const dcText = (name: string) => opfDoc.getElementsByTagNameNS("http://purl.org/dc/elements/1.1/", name)[0]?.textContent?.trim() || undefined;
+      bookInfoRef.current = { title: dcText("title"), author: dcText("creator") };
       const manifestItems = Array.from(opfDoc.querySelectorAll("manifest > item"));
       const spineItems = Array.from(opfDoc.querySelectorAll("spine > itemref"));
       
@@ -540,12 +543,18 @@ export default function App() {
         const htmlDoc = parseChapterDoc(content);
         const elements = getTranslatableBlocks(htmlDoc);
         const texts = elements.map(blockText);
+        // What each paragraph became: the (possibly simplified) English and its translation,
+        // fed back to the model as context for the paragraphs that follow.
+        const sourceUsed = [...texts];
+        const translated: (string | undefined)[] = [];
 
-        // A few batches are translated at once; their results are applied in document order.
-        for (let start = 0; start < elements.length; start += BATCH_SIZE * PARALLEL_BATCHES) {
+        // Google: a few batches at once. AI model: one batch at a time, so each batch sees how the
+        // previous one was translated. Results are applied in document order either way.
+        const waveSpan = BATCH_SIZE * (config.engine === 'llm' ? 1 : PARALLEL_BATCHES);
+        for (let start = 0; start < elements.length; start += waveSpan) {
           if (pauseRef.current) break;
           const wave: number[] = [];
-          for (let b = start; b < Math.min(start + BATCH_SIZE * PARALLEL_BATCHES, elements.length); b += BATCH_SIZE) wave.push(b);
+          for (let b = start; b < Math.min(start + waveSpan, elements.length); b += BATCH_SIZE) wave.push(b);
 
           const waveResults = await Promise.all(wave.map(async batchStart => {
             let payload = [];
@@ -553,9 +562,16 @@ export default function App() {
               if (texts[k]) payload.push({ id: k, text: texts[k] });
             }
             if (payload.length === 0) return { translations: [], simplified: new Map<number, string>() };
+            const contextStart = Math.max(0, batchStart - CONTEXT_PARAGRAPHS);
+            const previousPairs = [];
+            for (let k = contextStart; k < batchStart; k++) {
+              if (translated[k]) previousPairs.push({ source: sourceUsed[k], translation: translated[k]! });
+            }
             const context = {
-              precedingText: texts.slice(Math.max(0, batchStart - CONTEXT_PARAGRAPHS), batchStart).filter(Boolean),
+              precedingText: sourceUsed.slice(contextStart, batchStart).filter(Boolean),
+              previousPairs,
               names: bookNamesRef.current,
+              book: bookInfoRef.current,
               onLlmError: reportLlmError,
             };
             // Graded-reader mode: rewrite the English first (not headings or very short lines),
@@ -570,8 +586,14 @@ export default function App() {
           if (pauseRef.current) break;
 
           for (const { translations, simplified } of waveResults) {
-            simplified.forEach((text, id) => replaceText(htmlDoc, elements[id], text));
-            translations.forEach(t => applyTranslation(htmlDoc, elements[t.id], t.translation));
+            simplified.forEach((text, id) => {
+              sourceUsed[id] = text;
+              replaceText(htmlDoc, elements[id], text);
+            });
+            translations.forEach(t => {
+              translated[t.id] = t.translation;
+              applyTranslation(htmlDoc, elements[t.id], t.translation);
+            });
           }
 
           // --- LIVE PREVIEW UPDATE ---

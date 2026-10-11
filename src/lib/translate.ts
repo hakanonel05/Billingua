@@ -8,6 +8,11 @@ export interface TranslateContext {
   precedingText?: string[];
   // Recurring character/place names that must stay unchanged (AI engine only).
   names?: string[];
+  // The paragraphs right before this batch together with their translations, so names, terms,
+  // forms of address and voice stay consistent across the book (AI engine only).
+  previousPairs?: { source: string; translation: string }[];
+  // Title and author, so the model knows what kind of book it is translating (AI engine only).
+  book?: { title?: string; author?: string };
   // Told when the AI engine fails for good (server down, bad key, quota), so the UI can say so.
   onLlmError?: (err: Error) => void;
 }
@@ -76,12 +81,36 @@ export async function translateWithLlm(
   config: AppConfig,
   context: TranslateContext = {},
 ): Promise<TranslationResult[]> {
-  let instruction = `You are a professional book translator. Translate the text from ${languageName(config.sourceLang)} into ${languageName(config.targetLang)}. Translate faithfully and completely; never summarize, merge paragraphs or add notes. Maintain literary tone for fiction, and clear tone for non-fiction.`;
-  if (config.tone !== 'default') instruction += ` Use a ${config.tone} tone.`;
-  if (context.names?.length) instruction += ` Keep these names exactly as written: ${context.names.join(', ')}.`;
-  if (config.customGlossary) instruction += `\nFollow these glossary rules:\n${config.customGlossary}`;
+  const target = languageName(config.targetLang);
+  const lines = [`You are an experienced literary translator from ${languageName(config.sourceLang)} into ${target}.`];
+  if (context.book?.title) {
+    lines.push(`You are translating the book "${context.book.title}"${context.book.author ? ` by ${context.book.author}` : ''}.`);
+  }
+  lines.push(
+    `Write the way a skilled ${target} translator would publish it:`,
+    `- Translate the meaning, not word for word. Render idioms, phrasal verbs and figurative verbs (someone who "barked" or "snapped" a reply, "shook" with fear) with the natural ${target} expression for what is meant.`,
+    `- Use natural ${target} word order, rhythm and punctuation. Keep the dialogue quotation marks of the original.`,
+    `- Keep each character's voice, and keep names, recurring terms and forms of address consistent with the previous passage.`,
+    `- Translate every sentence completely: never summarize, merge or split paragraphs, and never add notes or explanations.`,
+    `- Maintain a literary tone for fiction and a clear tone for non-fiction.`,
+  );
+  if (config.targetLang.startsWith('tr')) {
+    lines.push('- Choose "sen" or "siz" from the relationship between the speakers and keep that choice for the same pair of characters.');
+  }
+  if (config.tone !== 'default') lines.push(`- Use a ${config.tone} tone.`);
+  if (context.names?.length) lines.push(`- Keep these names exactly as written: ${context.names.join(', ')}.`);
+  if (config.customGlossary) lines.push(`Follow these glossary rules:\n${config.customGlossary}`);
 
-  const translated = await mapParagraphs(config, instruction, texts, context.precedingText);
+  // Earlier source paragraphs with the translations already chosen for them; the source alone
+  // when nothing has been translated yet.
+  let contextBlock: string | string[] = context.precedingText || [];
+  if (context.previousPairs?.length) {
+    contextBlock = 'The previous passage and how it was translated, for consistency only (do not include it in the output):\n"""\n'
+      + context.previousPairs.map(p => `${p.source}\n=> ${p.translation}`).join('\n\n')
+      + '\n"""';
+  }
+
+  const translated = await mapParagraphs(config, lines.join('\n'), texts, contextBlock);
   return Array.from(translated, ([id, translation]) => ({ id, translation }));
 }
 

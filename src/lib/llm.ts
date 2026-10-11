@@ -99,6 +99,21 @@ export async function listModels(s: LlmSettings): Promise<string[]> {
   return ids.sort((a, b) => a.localeCompare(b));
 }
 
+const MAX_BUSY_RETRIES = 4;
+const MAX_RETRY_WAIT_MS = 65_000;
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// Honors Retry-After (seconds or HTTP date) when the server sends it, else backs off 2s, 4s, 8s...
+export const retryDelayMs = (res: Response, attempt: number): number => {
+  const header = res.headers.get('retry-after');
+  let ms = NaN;
+  if (header) {
+    ms = /^\d+(\.\d+)?$/.test(header.trim()) ? parseFloat(header) * 1000 : Date.parse(header) - Date.now();
+  }
+  if (!Number.isFinite(ms) || ms < 0) ms = 2000 * 2 ** attempt;
+  return Math.min(ms + 250, MAX_RETRY_WAIT_MS);
+};
+
 export async function chat(
   s: LlmSettings,
   messages: { role: 'system' | 'user'; content: string }[],
@@ -107,12 +122,19 @@ export async function chat(
   const body: Record<string, unknown> = { model: s.llmModel.trim(), messages, temperature: 0.2, stream: false };
   if (json) body.response_format = { type: 'json_object' };
 
+  // Free tiers (Groq, OpenRouter) limit requests and tokens per minute: wait as told and retry
+  // instead of giving up on the model. Only a limit that outlasts the retries is reported.
   let res: Response;
-  try {
-    res = await fetch(endpoint(s, '/chat/completions'), { method: 'POST', headers: headers(s), body: JSON.stringify(body), signal });
-  } catch (e) {
-    if ((e as Error)?.name === 'AbortError') throw e;
-    throw new LlmError(describeNetworkError(s), 0);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      res = await fetch(endpoint(s, '/chat/completions'), { method: 'POST', headers: headers(s), body: JSON.stringify(body), signal });
+    } catch (e) {
+      if ((e as Error)?.name === 'AbortError') throw e;
+      throw new LlmError(describeNetworkError(s), 0);
+    }
+    const busy = res.status === 429 || res.status === 503;
+    if (!busy || attempt >= MAX_BUSY_RETRIES) break;
+    await sleep(retryDelayMs(res, attempt));
   }
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
@@ -145,16 +167,19 @@ export interface IdText {
 // Runs one instruction over a batch of paragraphs. The batch goes out as one JSON request; when a
 // (small, local) model returns broken JSON or skips items, the missing ones are retried one by one
 // as plain text, which even weak models handle. Returns whatever came back; failures are omitted.
+// `context` is either the preceding source paragraphs or a ready-made context block.
 export async function mapParagraphs(
   s: LlmSettings,
   instruction: string,
   items: IdText[],
-  context: string[] = [],
+  context: string[] | string = [],
 ): Promise<Map<number, string>> {
   const results = new Map<number, string>();
-  const contextBlock = context.length
-    ? `The passage just before these texts, for context only (do not include it in the output):\n"""\n${context.join('\n\n')}\n"""\n\n`
-    : '';
+  const contextBlock = typeof context === 'string'
+    ? (context ? `${context}\n\n` : '')
+    : context.length
+      ? `The passage just before these texts, for context only (do not include it in the output):\n"""\n${context.join('\n\n')}\n"""\n\n`
+      : '';
 
   if (items.length > 1) {
     try {

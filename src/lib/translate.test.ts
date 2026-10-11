@@ -106,6 +106,37 @@ describe('translateBatch with an open-source model', () => {
     expect(llm[0].body.messages[0].content).toContain('Turkish');
   });
 
+  it('shows the model how the previous paragraphs were translated, and what book it is', async () => {
+    const { llm } = installNetwork({ llmReply: modelThat(t => `tr:${t}`) });
+    await translateBatch(
+      [{ id: 5, text: 'He barked a laugh.' }, { id: 6, text: 'Then he left.' }],
+      config({ engine: 'llm', llmBaseUrl: 'http://pairs.test/v1' }),
+      notPaused,
+      {
+        precedingText: ['The Doctor smiled.'],
+        previousPairs: [{ source: 'The Doctor smiled.', translation: 'Doktor gülümsedi.' }],
+        book: { title: 'The Sontaran Games', author: 'Jacqueline Rayner' },
+      },
+    );
+    const [system, user] = llm[0].body.messages.map((m: any) => m.content);
+    expect(user).toContain('The Doctor smiled.\n=> Doktor gülümsedi.');
+    expect(system).toContain('"The Sontaran Games" by Jacqueline Rayner');
+    expect(system).toContain('"sen" or "siz"');
+  });
+
+  it('waits and retries when a free tier says "too many requests"', async () => {
+    let calls = 0;
+    const { gtx } = installNetwork({
+      llmReply: body => (++calls === 1
+        ? new Response('slow down', { status: 429, headers: { 'retry-after': '0' } })
+        : modelThat(t => `tr:${t}`)(body)),
+    });
+    const out = await translateBatch([{ id: 1, text: 'one' }, { id: 2, text: 'two' }], config({ engine: 'llm', llmBaseUrl: 'http://busy.test/v1' }), notPaused);
+    expect(out.map(r => r.translation)).toEqual(['tr:one', 'tr:two']);
+    expect(calls).toBe(2);
+    expect(gtx).toEqual([]); // no fallback to Google
+  });
+
   it('falls back to Google and reports it when the server is down', async () => {
     let reported: Error | undefined;
     const { gtx } = installNetwork({ llmReply: () => { throw new TypeError('Failed to fetch'); } });
