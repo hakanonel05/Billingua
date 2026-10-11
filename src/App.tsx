@@ -1213,7 +1213,7 @@ export default function App() {
                       >
                         <option value="gtx">Google Translate (Ücretsiz)</option>
                         <option value="gtx-fallback">Google Translate + Yapay Zeka Yedek</option>
-                        <option value="llm">Açık Kaynak Yapay Zeka</option>
+                        <option value="llm">Yapay Zeka (Google taslağı + düzeltme) — en iyi kalite</option>
                       </select>
                       <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
                         <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>

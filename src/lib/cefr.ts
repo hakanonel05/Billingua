@@ -141,6 +141,11 @@ const normalizeApostrophes = (text: string) => text.replace(/[\u2019\u02BC]/g, "
 // Sentence-initial function words ("The", "However") are capitalized too, so the most common
 // words never count as names even when the text has no lowercase occurrence.
 const NEVER_A_NAME_RANK = 300;
+const HEADING_WORDS = new Set([
+  'chapter', 'part', 'book', 'volume', 'prologue', 'epilogue', 'contents', 'introduction', 'preface',
+  'foreword', 'afterword', 'appendix', 'index', 'notes', 'acknowledgements', 'acknowledgments', 'glossary', 'interlude',
+]);
+const NUMBER_WORD_RE = /^(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|final)$/;
 
 // Capitalized words whose lowercase form never occurs in the text: character and place names.
 export function findProperNouns(text: string, table?: RankTable): Map<string, number> {
@@ -155,8 +160,10 @@ export function findProperNouns(text: string, table?: RankTable): Map<string, nu
   const names = new Map<string, number>();
   capitalized.forEach((count, w) => {
     const lower = w.toLowerCase();
-    if (lowercase.has(lower)) return;
+    if (w.includes("'") || lowercase.has(lower)) return; // "I'm", "Emma's"
     if (table && (table.get(lower) ?? Infinity) <= NEVER_A_NAME_RANK) return;
+    // All-caps headings ("CHAPTER THIRTEEN") are not names; other all-caps words ("TARDIS", "NASA") are.
+    if (w === w.toUpperCase() && (HEADING_WORDS.has(lower) || NUMBER_WORD_RE.test(lower))) return;
     names.set(w, count);
   });
   return names;

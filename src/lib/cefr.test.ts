@@ -61,6 +61,11 @@ describe('proper nouns', () => {
     expect(names.has('Then')).toBe(false);
   });
 
+  it('ignores contractions, possessives and all-caps headings', () => {
+    const names = findProperNouns("CHAPTER THIRTEEN. Emma's TARDIS hummed. I'm here, said Emma. I'll go.", table);
+    expect(Array.from(names.keys()).sort()).toEqual(['Emma', 'TARDIS']);
+  });
+
   it('keeps only recurring, uncommon names for the translator', () => {
     expect(frequentNames(text, table)).toEqual(['Ishmael']);
   });

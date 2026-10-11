@@ -45,7 +45,8 @@ const modelThat = (fn: (text: string) => string, { skipIds = [] as number[] } = 
     const { items } = JSON.parse(user.slice(user.indexOf('{"items"')));
     return JSON.stringify({ items: items.filter((i: any) => !skipIds.includes(i.id)).map((i: any) => ({ id: i.id, text: fn(i.text) })) });
   }
-  return fn(user.split('"""\n\n').pop()!);
+  const plain = user.split('"""\n\n').pop()!;
+  return fn(plain.match(/^Text:\n([\s\S]*?)\n\nDraft translation/)?.[1] ?? plain);
 };
 
 beforeEach(() => {
@@ -97,7 +98,7 @@ describe('translateBatch with an open-source model', () => {
 
     // the batch request, then a plain-text retry for the skipped paragraph
     expect(out).toEqual([{ id: 1, translation: 'tr:one' }, { id: 2, translation: 'tr:two' }]);
-    expect(gtx).toEqual([]);
+    expect(gtx).toHaveLength(1); // one request for the Google drafts of both paragraphs
     expect(llm).toHaveLength(2);
     expect(llm[0].url).toBe('http://localhost:11434/v1/chat/completions');
     expect(llm[0].body.model).toBe('test-model');
@@ -134,7 +135,18 @@ describe('translateBatch with an open-source model', () => {
     const out = await translateBatch([{ id: 1, text: 'one' }, { id: 2, text: 'two' }], config({ engine: 'llm', llmBaseUrl: 'http://busy.test/v1' }), notPaused);
     expect(out.map(r => r.translation)).toEqual(['tr:one', 'tr:two']);
     expect(calls).toBe(2);
-    expect(gtx).toEqual([]); // no fallback to Google
+    expect(gtx).toHaveLength(1); // only the drafts: the model was not replaced by Google
+  });
+
+  it('gives the model a Google draft to refine, and says how to use it', async () => {
+    const { llm } = installNetwork({ llmReply: modelThat(t => `tr:${t}`) });
+    await translateBatch([{ id: 1, text: 'one' }, { id: 2, text: 'two' }], config({ engine: 'llm', llmBaseUrl: 'http://draft.test/v1' }), notPaused);
+    const [system, user] = llm[0].body.messages.map((m: any) => m.content);
+    expect(JSON.parse(user.slice(user.indexOf('{"items"'))).items).toEqual([
+      { id: 1, text: 'one', draft: 'ONE' },
+      { id: 2, text: 'two', draft: 'TWO' },
+    ]);
+    expect(system).toContain('"draft", a machine translation');
   });
 
   it('falls back to Google and reports it when the server is down', async () => {

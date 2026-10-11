@@ -37,7 +37,7 @@ export const LLM_PRESETS: LlmPreset[] = [
     id: 'groq',
     name: 'Groq — açık modeller, bulutta',
     baseUrl: 'https://api.groq.com/openai/v1',
-    model: 'llama-3.3-70b-versatile',
+    model: 'qwen/qwen3.8-27b',
     needsKey: true,
     hint: 'console.groq.com adresinden ücretsiz bir anahtar alın.',
   },
@@ -141,8 +141,10 @@ export async function chat(
     throw new LlmError(`Yapay zeka sunucusu HTTP ${res.status} döndürdü ${detail.slice(0, 200)}`, res.status);
   }
   const data = await res.json();
-  const content = data?.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || !content.trim()) throw new LlmError('Yapay zeka boş yanıt döndürdü');
+  const raw = data?.choices?.[0]?.message?.content;
+  // Reasoning models (Qwen 3, DeepSeek R1) may put their thinking in the reply; drop it.
+  const content = typeof raw === 'string' ? raw.replace(/<think>[\s\S]*?<\/think>/g, '').trim() : '';
+  if (!content) throw new LlmError('Yapay zeka boş yanıt döndürdü');
   return content;
 }
 
@@ -162,6 +164,8 @@ export function parseJsonReply(reply: string): any {
 export interface IdText {
   id: number;
   text: string;
+  // Optional machine-translation draft the model may refine.
+  draft?: string;
 }
 
 // Runs one instruction over a batch of paragraphs. The batch goes out as one JSON request; when a
@@ -207,7 +211,9 @@ export async function mapParagraphs(
     try {
       const reply = await chat(s, [
         { role: 'system', content: `${instruction}\nAnswer with the resulting text only: no quotes around it, no explanations, no notes.` },
-        { role: 'user', content: `${contextBlock}${item.text}` },
+        { role: 'user', content: item.draft
+          ? `${contextBlock}Text:\n${item.text}\n\nDraft translation (may be wrong):\n${item.draft}`
+          : `${contextBlock}${item.text}` },
       ]);
       results.set(item.id, reply.trim());
     } catch (err) {

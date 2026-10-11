@@ -51,8 +51,9 @@ const hash = (s: string) => {
 };
 
 const GTX_NS = 'gtx';
+// "d1": translations refined from a Google draft (kept apart from older from-scratch results).
 const llmNamespace = (config: AppConfig) =>
-  `llm:${hash(config.llmBaseUrl.trim())}:${config.llmModel.trim()}:${config.tone}:${hash(config.customGlossary || '')}`;
+  `llm-d1:${hash(config.llmBaseUrl.trim())}:${config.llmModel.trim()}:${config.tone}:${hash(config.customGlossary || '')}`;
 const cacheKey = (ns: string, config: AppConfig, text: string) =>
   `${ns}|${config.sourceLang}>${config.targetLang}|${text}`;
 
@@ -80,6 +81,7 @@ export async function translateWithLlm(
   texts: TranslationPayload[],
   config: AppConfig,
   context: TranslateContext = {},
+  drafts: Map<number, string> = new Map(),
 ): Promise<TranslationResult[]> {
   const target = languageName(config.targetLang);
   const lines = [`You are an experienced literary translator from ${languageName(config.sourceLang)} into ${target}.`];
@@ -91,14 +93,19 @@ export async function translateWithLlm(
     `- Translate the meaning, not word for word. Render idioms, phrasal verbs and figurative verbs (someone who "barked" or "snapped" a reply, "shook" with fear) with the natural ${target} expression for what is meant.`,
     `- Use natural ${target} word order, rhythm and punctuation. Keep the dialogue quotation marks of the original.`,
     `- Keep each character's voice, and keep names, recurring terms and forms of address consistent with the previous passage.`,
+    `- Read the source in its own variety of English: in British English a "torch" is a flashlight, "trainers" are sneakers, a "flat" is an apartment.`,
+    `- Render hesitations and interjections (er, um, mm, oh) with their natural ${target} equivalents instead of copying them.`,
     `- Translate every sentence completely: never summarize, merge or split paragraphs, and never add notes or explanations.`,
     `- Maintain a literary tone for fiction and a clear tone for non-fiction.`,
   );
   if (config.targetLang.startsWith('tr')) {
-    lines.push('- Choose "sen" or "siz" from the relationship between the speakers and keep that choice for the same pair of characters.');
+    lines.push('- Choose "sen" or "siz" from the relationship between the speakers and keep that choice for the same pair of characters, also within a single paragraph (do not switch from "geldin" to "sizi").');
   }
   if (config.tone !== 'default') lines.push(`- Use a ${config.tone} tone.`);
   if (context.names?.length) lines.push(`- Keep these names exactly as written: ${context.names.join(', ')}.`);
+  if (drafts.size) {
+    lines.push(`- Items come with "draft", a machine translation. It is often literal and sometimes wrong: use it only as a reference for the meaning. Fix mistranslations, word-for-word idioms, wrong word senses, unnatural word order and leftover English words. Give your own final, polished translation of "text", not a comment on the draft.`);
+  }
   if (config.customGlossary) lines.push(`Follow these glossary rules:\n${config.customGlossary}`);
 
   // Earlier source paragraphs with the translations already chosen for them; the source alone
@@ -110,7 +117,8 @@ export async function translateWithLlm(
       + '\n"""';
   }
 
-  const translated = await mapParagraphs(config, lines.join('\n'), texts, contextBlock);
+  const items = texts.map(t => (drafts.has(t.id) ? { ...t, draft: drafts.get(t.id) } : t));
+  const translated = await mapParagraphs(config, lines.join('\n'), items, contextBlock);
   return Array.from(translated, ([id, translation]) => ({ id, translation }));
 }
 
@@ -278,10 +286,10 @@ export async function translateBatch(
     }
   };
 
-  const runLlm = async (items: TranslationPayload[]) => {
+  const runLlm = async (items: TranslationPayload[], drafts?: Map<number, string>) => {
     if (items.length === 0 || !llmAvailable(config)) return;
     try {
-      record(llmNs, await translateWithLlm(items, config, context));
+      record(llmNs, await translateWithLlm(items, config, context, drafts));
     } catch (err) {
       console.error("AI engine error", err);
       if (isFatal(err)) {
@@ -308,9 +316,17 @@ export async function translateBatch(
     });
   }
 
-  // 2. The AI model as the primary engine.
-  if (config.engine === 'llm') {
-    await runLlm(pending);
+  // 2. The AI model as the primary engine: Google drafts first (fast, free, usually right about
+  // the meaning), then the model turns them into natural, consistent prose. Paragraphs the model
+  // can't do keep their Google draft.
+  if (config.engine === 'llm' && pending.length) {
+    const drafts = new Map<number, string>();
+    for (const chunk of chunkByChars(pending)) {
+      if (pauseRef.current) break;
+      for (const r of await translateChunkGtx(chunk, config, pauseRef, async () => {})) drafts.set(r.id, r.translation);
+    }
+    await runLlm(pending, drafts);
+    record(GTX_NS, pending.filter(t => drafts.has(t.id)).map(t => ({ id: t.id, translation: drafts.get(t.id)! })));
     pending = pending.filter(t => !results.has(t.id));
   }
 
