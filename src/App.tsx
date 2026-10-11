@@ -41,11 +41,12 @@ export default function App() {
     sourceLang: 'auto',
     targetLang: 'tr',
     layout: 'side-by-side',
-    engine: 'gtx',
+    engine: 'llm', // open-source model by default; falls back to Google Translate without a key
     llmProvider: LLM_PRESETS[0].id,
     llmBaseUrl: LLM_PRESETS[0].baseUrl,
     llmModel: LLM_PRESETS[0].model,
     llmApiKey: '',
+    llmKeys: {},
     simplifyLevel: 'off',
     buildGlossary: true,
     customBg: '#f8f9fa',
@@ -349,14 +350,18 @@ export default function App() {
   // --- Step 3: Processing ---
   const processBook = async () => {
     if (!zipInstance) return;
-    if (needsLlm && !isLlmConfigured(config)) {
-      setErrorMsg('Yapay zeka seçenekleri için sunucu adresi ve model gerekli. Ayarlardaki "Açık Kaynak Yapay Zeka" bölümünü doldurun.');
+    const llmReady = isLlmConfigured(config);
+    // Simplifying needs the model; translating does not, Google Translate takes over.
+    if (config.simplifyLevel !== 'off' && !llmReady) {
+      setErrorMsg('Metni sadeleştirmek için yapay zeka gerekli. Ayarlardaki "Açık Kaynak Yapay Zeka" bölümünde bir servis seçip anahtarını girin.');
       return;
     }
     setStep(3);
     setIsPaused(false);
     pauseRef.current = false;
-    setErrorMsg('');
+    setErrorMsg(config.engine !== 'gtx' && !llmReady
+      ? 'Yapay zeka için anahtar ya da model girilmedi; çeviri Google Translate ile yapılıyor.'
+      : '');
     
     llmErrorShownRef.current = false;
     const selectedChapters = chapters.filter(c => c.selected);
@@ -1260,7 +1265,9 @@ export default function App() {
                             value={config.llmProvider}
                             onChange={e => {
                               const preset = LLM_PRESETS.find(p => p.id === e.target.value)!;
-                              setConfig({ ...config, llmProvider: preset.id, llmBaseUrl: preset.baseUrl || config.llmBaseUrl, llmModel: preset.model });
+                              // Each service keeps its own key, so switching never sends a Groq key to Google.
+                              const llmKeys = { ...config.llmKeys, [config.llmProvider]: config.llmApiKey };
+                              setConfig({ ...config, llmKeys, llmProvider: preset.id, llmBaseUrl: preset.baseUrl || config.llmBaseUrl, llmModel: preset.model, llmApiKey: llmKeys[preset.id] || '' });
                               setLlmModels([]);
                               setLlmStatus({ kind: 'idle' });
                             }}
@@ -1307,7 +1314,7 @@ export default function App() {
                           <input
                             type="password"
                             value={config.llmApiKey}
-                            onChange={e => setConfig({...config, llmApiKey: e.target.value})}
+                            onChange={e => setConfig({ ...config, llmApiKey: e.target.value, llmKeys: { ...config.llmKeys, [config.llmProvider]: e.target.value } })}
                             placeholder={LLM_PRESETS.find(p => p.id === config.llmProvider)?.needsKey ? 'Anahtarınızı girin...' : 'Yerel sunucu için boş bırakın'}
                             className={`w-full border rounded-xl px-3 py-2.5 outline-none focus:ring-2 focus:ring-blue-500 ${isDarkMode ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-300 placeholder-slate-400'}`}
                           />

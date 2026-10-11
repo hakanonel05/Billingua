@@ -1,7 +1,9 @@
 // Client for any OpenAI-compatible chat server: local open-source runtimes (Ollama, LM Studio,
-// llama.cpp, vLLM) or hosted open models (Groq, OpenRouter). Calls go straight from the browser.
+// llama.cpp, vLLM), hosted open models (Groq, OpenRouter) or Google's Gemini API.
+// Calls go straight from the browser.
 
 export interface LlmSettings {
+  llmProvider?: string;
   llmBaseUrl: string;
   llmModel: string;
   llmApiKey: string;
@@ -16,7 +18,24 @@ export interface LlmPreset {
   hint: string;
 }
 
+// The first preset is the default: an open model, fast and free (needs a free key).
 export const LLM_PRESETS: LlmPreset[] = [
+  {
+    id: 'groq',
+    name: 'Groq — açık modeller, bulutta (önerilen)',
+    baseUrl: 'https://api.groq.com/openai/v1',
+    model: 'qwen/qwen3.8-27b',
+    needsKey: true,
+    hint: 'console.groq.com adresinden ücretsiz bir anahtar alın. Qwen modeli Türkçe edebi çeviride Google\'dan belirgin şekilde iyi sonuç veriyor.',
+  },
+  {
+    id: 'google',
+    name: 'Google AI Studio — Gemini (Google API anahtarıyla)',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    model: 'gemini-3.8-flash',
+    needsKey: true,
+    hint: 'aistudio.google.com/apikey adresinden anahtar alın. Gemini Flash hızlıdır ama açık kaynak değildir; buradaki açık Gemma modelleri ise çok yavaştır. Limitleri aistudio.google.com/rate-limit sayfasında görebilirsiniz.',
+  },
   {
     id: 'ollama',
     name: 'Ollama — bilgisayarımda, ücretsiz',
@@ -32,14 +51,6 @@ export const LLM_PRESETS: LlmPreset[] = [
     model: '',
     needsKey: false,
     hint: 'LM Studio\'da bir model indirin, Developer sekmesinden sunucuyu başlatın ve "Enable CORS" seçeneğini açın.',
-  },
-  {
-    id: 'groq',
-    name: 'Groq — açık modeller, bulutta',
-    baseUrl: 'https://api.groq.com/openai/v1',
-    model: 'qwen/qwen3.8-27b',
-    needsKey: true,
-    hint: 'console.groq.com adresinden ücretsiz bir anahtar alın.',
   },
   {
     id: 'openrouter',
@@ -59,7 +70,11 @@ export const LLM_PRESETS: LlmPreset[] = [
   },
 ];
 
-export const isLlmConfigured = (s: LlmSettings) => !!s.llmBaseUrl.trim() && !!s.llmModel.trim();
+export const presetOf = (s: LlmSettings) => LLM_PRESETS.find(p => p.id === s.llmProvider);
+
+// Ready to use: a server, a model, and a key when the service needs one.
+export const isLlmConfigured = (s: LlmSettings) =>
+  !!s.llmBaseUrl.trim() && !!s.llmModel.trim() && !(presetOf(s)?.needsKey && !s.llmApiKey.trim());
 
 const endpoint = (s: LlmSettings, path: string) => `${s.llmBaseUrl.trim().replace(/\/+$/, '')}${path}`;
 
@@ -99,10 +114,18 @@ export async function listModels(s: LlmSettings): Promise<string[]> {
   return ids.sort((a, b) => a.localeCompare(b));
 }
 
-const MAX_BUSY_RETRIES = 4;
-
 export const stripThinking = (reply: string) =>
   reply.replace(/<think>[\s\S]*?<\/think>|<thought>[\s\S]*?<\/thought>/g, '').trim();
+
+// Gemini models think before answering unless told not to, which makes a translation several
+// times slower without making it better. Some (Flash-Lite, Gemma) reject the switch; those are
+// remembered and asked again without it.
+const rejectsNoReasoning = new Set<string>();
+const wantsNoReasoning = (s: LlmSettings) =>
+  /generativelanguage\.googleapis\.com/.test(s.llmBaseUrl) && /^gemini-/.test(s.llmModel.trim())
+  && !rejectsNoReasoning.has(s.llmModel.trim());
+
+const MAX_BUSY_RETRIES = 4;
 const MAX_RETRY_WAIT_MS = 65_000;
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
@@ -124,6 +147,7 @@ export async function chat(
 ): Promise<string> {
   const body: Record<string, unknown> = { model: s.llmModel.trim(), messages, temperature: 0.2, stream: false };
   if (json) body.response_format = { type: 'json_object' };
+  if (wantsNoReasoning(s)) body.reasoning_effort = 'none';
 
   // Free tiers (Groq, OpenRouter) limit requests and tokens per minute: wait as told and retry
   // instead of giving up on the model. Only a limit that outlasts the retries is reported.
@@ -134,6 +158,11 @@ export async function chat(
     } catch (e) {
       if ((e as Error)?.name === 'AbortError') throw e;
       throw new LlmError(describeNetworkError(s), 0);
+    }
+    if (res.status === 400 && 'reasoning_effort' in body) {
+      rejectsNoReasoning.add(s.llmModel.trim());
+      delete body.reasoning_effort;
+      continue;
     }
     // 429: rate limit. 5xx: transient server errors (Google's endpoint returns occasional 500s).
     const busy = res.status === 429 || res.status >= 500;

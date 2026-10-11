@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AppConfig } from '../types';
 import { translateBatch, simplifyBatch, chunkByChars } from './translate';
-import { parseJsonReply, mapParagraphs, LlmError, isFatal, stripThinking } from './llm';
+import { parseJsonReply, mapParagraphs, LlmError, isFatal, stripThinking, isLlmConfigured, chat } from './llm';
 
 const config = (overrides: Partial<AppConfig> = {}): AppConfig => ({
   sourceLang: 'en', targetLang: 'tr', layout: 'side-by-side', engine: 'gtx',
-  llmProvider: 'ollama', llmBaseUrl: 'http://localhost:11434/v1', llmModel: 'test-model', llmApiKey: '',
+  llmProvider: 'ollama', llmBaseUrl: 'http://localhost:11434/v1', llmModel: 'test-model', llmApiKey: '', llmKeys: {},
   simplifyLevel: 'off', buildGlossary: false,
   customBg: '', customColor: '', minCefrLevel: 'B1', extractIdioms: false,
   contextualGlossary: false, tone: 'default', customGlossary: '',
@@ -186,6 +186,36 @@ describe('simplifyBatch', () => {
 });
 
 describe('llm helpers', () => {
+  it('treats a keyless cloud service as not configured, so Google takes over', async () => {
+    const { gtx, llm } = installNetwork({ llmReply: modelThat(t => `tr:${t}`) });
+    const groq = config({ engine: 'llm', llmProvider: 'groq', llmBaseUrl: 'https://api.groq.com/openai/v1' });
+    expect(isLlmConfigured(groq)).toBe(false);
+    expect(isLlmConfigured({ ...groq, llmApiKey: 'k' })).toBe(true);
+    const out = await translateBatch([{ id: 1, text: 'one' }], groq, notPaused);
+    expect(out).toEqual([{ id: 1, translation: 'ONE' }]);
+    expect(gtx).toEqual(['one']);
+    expect(llm).toEqual([]);
+  });
+
+  it('asks Gemini not to think, and drops the switch for models that reject it', async () => {
+    const google = (model: string) => config({ llmProvider: 'google', llmApiKey: 'k', llmModel: model, llmBaseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai' });
+    const { llm } = installNetwork({
+      llmReply: body => (body.model === 'gemini-lite' && body.reasoning_effort
+        ? new Response('{"error":{"message":"Request contains an invalid argument."}}', { status: 400 })
+        : 'tamam'),
+    });
+    expect(await chat(google('gemini-fast'), [{ role: 'user', content: 'x' }])).toBe('tamam');
+    expect(llm[0].body.reasoning_effort).toBe('none');
+
+    expect(await chat(google('gemini-lite'), [{ role: 'user', content: 'x' }])).toBe('tamam');
+    expect(llm.slice(1).map(c => c.body.reasoning_effort)).toEqual(['none', undefined]);
+    await chat(google('gemini-lite'), [{ role: 'user', content: 'x' }]); // remembered: no second 400
+    expect(llm[3].body.reasoning_effort).toBeUndefined();
+
+    await chat(config({ llmModel: 'qwen' }), [{ role: 'user', content: 'x' }]); // other servers: untouched
+    expect(llm[4].body.reasoning_effort).toBeUndefined();
+  });
+
   it('drops the thinking that reasoning models put in the reply', () => {
     expect(stripThinking('<think>hmm</think>{"items":[]}')).toBe('{"items":[]}');
     expect(stripThinking('<thought>* check\n* ok</thought>Merhaba')).toBe('Merhaba');

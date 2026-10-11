@@ -32,6 +32,8 @@ export interface AppConfig {
   llmBaseUrl: string;
   llmModel: string;
   llmApiKey: string;
+  // Keys per service (provider id -> key); llmApiKey is the one for the selected service.
+  llmKeys: Record<string, string>;
   simplifyLevel: SimplifyLevel;
   buildGlossary: boolean;
   customBg: string;
