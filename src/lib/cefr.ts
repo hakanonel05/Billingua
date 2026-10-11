@@ -1,7 +1,28 @@
+// Frequency-based CEFR estimation.
+// A word's level comes from its rank in an English frequency list (src/data/en-freq.txt),
+// mapped to the vocabulary sizes commonly associated with each CEFR level. Inflected forms
+// are reduced to candidate lemmas so "remarked" is rated like "remark".
 
-// Simplified CEFR Word List helper
-// In a real app, this would be a much larger database.
-// This list contains common English words categorized by CEFR level.
+export const CEFR_LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
+export type CEFRLevel = typeof CEFR_LEVELS[number];
+
+// Upper rank bound (inclusive) for each level; anything rarer (or not in the list) is C2.
+const RANK_LIMITS: [CEFRLevel, number][] = [
+  ['A1', 700],
+  ['A2', 1500],
+  ['B1', 3000],
+  ['B2', 5000],
+  ['C1', 10000],
+];
+
+// Share of running words a reader should know to follow a text comfortably.
+const COMFORTABLE_COVERAGE = 0.95;
+
+export interface WordInfo {
+  word: string;
+  count: number;
+  level: CEFRLevel;
+}
 
 export interface CEFRLevelStats {
   A1: number;
@@ -9,134 +30,198 @@ export interface CEFRLevelStats {
   B1: number;
   B2: number;
   C1: number;
-  unknown: number;
+  C2: number;
   total: number;
   unique: number;
-  topDifficultWords: { word: string; count: number; level: string }[];
+  estimatedLevel: CEFRLevel;
+  // Most frequent words, hardest-first within equal counts; filter by level in the UI.
+  words: WordInfo[];
 }
 
-const wordLevels: Record<string, string> = {
-  // A1 (Basic) - Heavily expanded
-  'the': 'A1', 'be': 'A1', 'to': 'A1', 'of': 'A1', 'and': 'A1', 'a': 'A1', 'in': 'A1', 'that': 'A1', 'have': 'A1', 'i': 'A1',
-  'it': 'A1', 'for': 'A1', 'not': 'A1', 'on': 'A1', 'with': 'A1', 'he': 'A1', 'as': 'A1', 'you': 'A1', 'do': 'A1', 'at': 'A1',
-  'this': 'A1', 'but': 'A1', 'his': 'A1', 'by': 'A1', 'from': 'A1', 'they': 'A1', 'we': 'A1', 'say': 'A1', 'her': 'A1', 'she': 'A1',
-  'or': 'A1', 'an': 'A1', 'will': 'A1', 'my': 'A1', 'one': 'A1', 'all': 'A1', 'would': 'A1', 'there': 'A1', 'their': 'A1', 'what': 'A1',
-  'so': 'A1', 'up': 'A1', 'out': 'A1', 'if': 'A1', 'get': 'A1', 'which': 'A1', 'go': 'A1', 'me': 'A1', 'can': 'A1', 'no': 'A1',
-  'him': 'A1', 'your': 'A1', 'know': 'A1', 'take': 'A1', 'people': 'A1', 'see': 'A1', 'now': 'A1', 'look': 'A1', 'more': 'A1', 'must': 'A1',
-  'has': 'A1', 'tell': 'A1', 'dear': 'A1', 'did': 'A1', 'don': 'A1', 'been': 'A1', 'well': 'A1', 'are': 'A1', 'was': 'A1', 'were': 'A1',
-  'apple': 'A1', 'boy': 'A1', 'cat': 'A1', 'dog': 'A1', 'eat': 'A1', 'fish': 'A1', 'girl': 'A1', 'house': 'A1', 'jump': 'A1',
-  'come': 'A1', 'good': 'A1', 'bad': 'A1', 'big': 'A1', 'small': 'A1', 'happy': 'A1',
-  'sad': 'A1', 'school': 'A1', 'water': 'A1', 'friend': 'A1', 'family': 'A1', 'father': 'A1', 'mother': 'A1', 'brother': 'A1', 'sister': 'A1',
-  'book': 'A1', 'pen': 'A1', 'paper': 'A1', 'read': 'A1', 'write': 'A1', 'listen': 'A1', 'speak': 'A1', 'learn': 'A1', 'man': 'A1', 'woman': 'A1',
-  'child': 'A1', 'children': 'A1', 'day': 'A1', 'night': 'A1', 'morning': 'A1', 'evening': 'A1', 'sun': 'A1', 'moon': 'A1', 'star': 'A1',
+export type RankTable = Map<string, number>;
 
-  // A2 (Elementary)
-  'able': 'A2', 'about': 'A2', 'above': 'A2', 'across': 'A2', 'address': 'A2', 'afraid': 'A2', 'afternoon': 'A2', 'again': 'A2', 'age': 'A2', 'ago': 'A2',
-  'airport': 'A2', 'album': 'A2', 'almost': 'A2', 'alone': 'A2', 'along': 'A2', 'already': 'A2', 'always': 'A2', 'amazing': 'A2',
-  'angry': 'A2', 'animal': 'A2', 'another': 'A2', 'answer': 'A2', 'anybody': 'A2', 'anyone': 'A2', 'anything': 'A2', 'anyway': 'A2', 'anywhere': 'A2',
-  'apartment': 'A2', 'area': 'A2', 'arm': 'A2', 'around': 'A2', 'arrive': 'A2', 'art': 'A2', 'article': 'A2', 'artist': 'A2', 'ask': 'A2', 'asleep': 'A2',
-  'aunt': 'A2', 'autumn': 'A2', 'away': 'A2', 'baby': 'A2', 'back': 'A2', 'background': 'A2', 'backpack': 'A2', 'bag': 'A2', 'bake': 'A2', 'ball': 'A2',
-  'bridge': 'A2', 'build': 'A2', 'bus': 'A2', 'busy': 'A2', 'buy': 'A2', 'cake': 'A2', 'camp': 'A2', 'cannot': 'A2', 'car': 'A2', 'card': 'A2',
+let rankTablePromise: Promise<RankTable> | null = null;
 
-  // B1 (Intermediate)
-  'ability': 'B1', 'abroad': 'B1', 'absent': 'B1', 'absolute': 'B1', 'accent': 'B1', 'accept': 'B1', 'acceptable': 'B1', 'access': 'B1', 'accident': 'B1', 'accommodate': 'B1',
-  'accommodation': 'B1', 'accompany': 'B1', 'according': 'B1', 'account': 'B1', 'accurate': 'B1', 'achieve': 'B1', 'achievement': 'B1', 'acid': 'B1', 'acoustic': 'B1', 'acquire': 'B1',
-  'act': 'B1', 'action': 'B1', 'active': 'B1', 'activity': 'B1', 'actor': 'B1', 'actress': 'B1', 'actual': 'B1', 'ad': 'B1', 'adapt': 'B1',
-  'add': 'B1', 'addition': 'B1', 'additional': 'B1', 'adequate': 'B1', 'adjust': 'B1', 'admire': 'B1', 'admission': 'B1', 'admit': 'B1', 'adopt': 'B1',
+export function parseRankTable(raw: string): RankTable {
+  const table: RankTable = new Map();
+  let rank = 0;
+  for (const line of raw.split('\n')) {
+    const word = line.trim();
+    if (!word || word.startsWith('#')) continue;
+    rank++;
+    if (!table.has(word)) table.set(word, rank);
+  }
+  return table;
+}
 
-  // B2 (Upper Intermediate)
-  'abandon': 'B2', 'abstract': 'B2', 'abuse': 'B2', 'academic': 'B2', 'accelerate': 'B2', 'acceptance': 'B2', 'accessory': 'B2', 'accomplish': 'B2',
-  'accordance': 'B2', 'accordingly': 'B2', 'accumulate': 'B2', 'accuracy': 'B2', 'accurately': 'B2', 'accusation': 'B2', 'accuse': 'B2', 'accustomed': 'B2', 'achievable': 'B2',
-  'acidic': 'B2', 'acknowledge': 'B2', 'acquisition': 'B2', 'adaptable': 'B2', 'adaptation': 'B2', 'adequately': 'B2', 'adhere': 'B2',
+export function loadRankTable(): Promise<RankTable> {
+  if (!rankTablePromise) {
+    rankTablePromise = import('../data/en-freq.txt?raw').then(m => parseRankTable(m.default));
+  }
+  return rankTablePromise;
+}
 
-  // C1 (Advanced)
-  'abolish': 'C1', 'abortion': 'C1', 'absurd': 'C1', 'abundance': 'C1', 'academy': 'C1', 'accessibility': 'C1',
-  'acclaimed': 'C1', 'accomplice': 'C1', 'accord': 'C1', 'accountability': 'C1', 'accountant': 'C1',
-  'accrue': 'C1', 'accustom': 'C1',
-};
+// The frequency list is mostly American English; British spellings borrow the American rank.
+export const americanSpelling = (word: string) => word
+  .replace(/our(s|ed|ing|able)?$/, 'or$1')
+  .replace(/(?<=[a-z]{2})is(e|es|ed|ing|ation|ations)$/, 'iz$1')
+  .replace(/yse(s|d)?$/, 'yze$1')
+  .replace(/([^aeiou])tre(s)?$/, '$1ter$2');
 
-// Heuristic for CEFR difficulty analysis
-export function analyzeCEFR(text: string): CEFRLevelStats {
-  // Use regex that captures casing to identify potential proper nouns
-  const originalWords = text.match(/\b([A-Z]*[a-z]+)\b/g) || [];
-  
-  const stats: CEFRLevelStats = {
-    A1: 0, A2: 0, B1: 0, B2: 0, C1: 0, unknown: 0, total: 0, unique: 0,
-    topDifficultWords: []
+// Candidate base forms for a lowercase English word, the word itself first.
+export function lemmaCandidates(word: string): string[] {
+  const out = [word];
+  const add = (w: string) => { if (w.length >= 2 && !out.includes(w)) out.push(w); };
+  const undouble = (stem: string) => {
+    if (stem.length >= 3 && stem[stem.length - 1] === stem[stem.length - 2] && !/[aeiou]/.test(stem[stem.length - 1])) {
+      add(stem.slice(0, -1));
+    }
   };
 
-  const wordCounts = new Map<string, number>();
-  const uniqueWords = new Set<string>();
-  
-  originalWords.forEach((rawWord: string) => {
-    if (rawWord.length < 3) return;
-    
-    // Heuristic: If it starts with Capital and isn't at start of sentence, it's likely a name
-    // (Rough check: if it has any capital letter after index 0 or starts with capital but is uncommon)
-    const isCapitalized = /^[A-Z]/.test(rawWord);
-    const word = rawWord.toLowerCase();
+  const american = americanSpelling(word);
+  add(american);
+  for (const form of new Set([word, american])) inflections(form);
+  return out;
 
-    // Ignore very common names or things that look like noise
-    if (word === 'hamlet' || word === 'ophelia' || word === 'horatio' || word === 'laertes' || word === 'polonius' || word === 'rosencrantz' || word === 'guildenstern') return;
-
-    stats.total++;
-    const level = wordLevels[word] || 'unknown';
-    
-    if (level === 'unknown') {
-      // If it's capitalized, we treat it as a likely proper noun and de-prioritize it in stats
-      if (isCapitalized) {
-         stats.A1++; // Treat names as A1 (everyone understands "John")
-      } else {
-         stats.unknown++;
-         wordCounts.set(word, (wordCounts.get(word) || 0) + 1);
-      }
-    } else {
-      (stats as any)[level]++;
-      // Track counts for words that are actually in our "hard" list
-      if (level === 'B1' || level === 'B2' || level === 'C1') {
-        wordCounts.set(word, (wordCounts.get(word) || 0) + 1);
-      }
+  function inflections(word: string) {
+    if (word.endsWith("'s")) add(word.slice(0, -2));
+    if (word.endsWith('ies') && word.length > 4) add(word.slice(0, -3) + 'y');
+    if (word.endsWith('es') && word.length > 3) add(word.slice(0, -2));
+    if (word.endsWith('s') && !word.endsWith('ss') && word.length > 3) add(word.slice(0, -1));
+    if (word.endsWith('ied') && word.length > 4) add(word.slice(0, -3) + 'y');
+    if (word.endsWith('ed') && word.length > 4) {
+      const stem = word.slice(0, -2);
+      add(stem); add(stem + 'e'); undouble(stem);
     }
-    uniqueWords.add(word);
+    if (word.endsWith('ing') && word.length > 5) {
+      const stem = word.slice(0, -3);
+      add(stem); add(stem + 'e'); undouble(stem);
+    }
+    if (word.endsWith('est') && word.length > 5) {
+      const stem = word.slice(0, -3);
+      add(stem); add(stem + 'e'); undouble(stem);
+      if (stem.endsWith('i')) add(stem.slice(0, -1) + 'y');
+    }
+    if (word.endsWith('er') && word.length > 4) {
+      const stem = word.slice(0, -2);
+      add(stem); add(stem + 'e'); undouble(stem);
+      if (stem.endsWith('i')) add(stem.slice(0, -1) + 'y');
+    }
+  }
+}
+
+export function rankOf(word: string, table: RankTable): number | undefined {
+  // "-er"/"-est" stripping misfires on real words (hunger → hung, corner → corn),
+  // so a listed word ending that way keeps its own rank.
+  const own = table.get(word);
+  if (own !== undefined && /(?:er|est)$/.test(word)) return own;
+  let best: number | undefined;
+  for (const candidate of lemmaCandidates(word)) {
+    const r = table.get(candidate);
+    if (r !== undefined && (best === undefined || r < best)) best = r;
+  }
+  return best;
+}
+
+export function levelOf(word: string, table: RankTable): CEFRLevel {
+  const rank = rankOf(word.toLowerCase(), table);
+  if (rank === undefined) return 'C2';
+  for (const [level, limit] of RANK_LIMITS) {
+    if (rank <= limit) return level;
+  }
+  return 'C2';
+}
+
+export const levelIndex = (level: string) => CEFR_LEVELS.indexOf(level as CEFRLevel);
+
+const WORD_RE = /[A-Za-z]+(?:'[A-Za-z]+)?/g;
+
+// Sentence-initial function words ("The", "However") are capitalized too, so the most common
+// words never count as names even when the text has no lowercase occurrence.
+const NEVER_A_NAME_RANK = 300;
+
+// Capitalized words whose lowercase form never occurs in the text: character and place names.
+export function findProperNouns(text: string, table?: RankTable): Map<string, number> {
+  const capitalized = new Map<string, number>();
+  const lowercase = new Set<string>();
+  for (const m of text.matchAll(WORD_RE)) {
+    const w = m[0];
+    if (/^[A-Z][a-z]/.test(w)) capitalized.set(w, (capitalized.get(w) || 0) + 1);
+    else if (/^[a-z]/.test(w)) lowercase.add(w);
+  }
+  const names = new Map<string, number>();
+  capitalized.forEach((count, w) => {
+    const lower = w.toLowerCase();
+    if (lowercase.has(lower)) return;
+    if (table && (table.get(lower) ?? Infinity) <= NEVER_A_NAME_RANK) return;
+    names.set(w, count);
   });
+  return names;
+}
 
-  stats.unique = uniqueWords.size;
-
-  // Get top difficult words (longest/most frequent difficult words)
-  stats.topDifficultWords = Array.from(wordCounts.entries())
+// Names worth telling a translator to keep as-is: recurring and not ordinary words.
+export function frequentNames(text: string, table: RankTable, limit = 40): string[] {
+  return Array.from(findProperNouns(text, table).entries())
+    .filter(([w, count]) => count >= 3 && levelIndex(levelOf(w, table)) >= levelIndex('B1'))
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 25)
-    .map(entry => ({
-      word: entry[0],
-      count: entry[1],
-      level: wordLevels[entry[0]] || 'unknown'
-    }));
+    .slice(0, limit)
+    .map(([w]) => w);
+}
 
-  // Refine statistics ... unknown words in actual prose are usually harder
-  const unknownPool = stats.unknown;
-  stats.B2 += Math.floor(unknownPool * 0.3);
-  stats.C1 += Math.floor(unknownPool * 0.2);
-  stats.B1 += Math.floor(unknownPool * 0.3);
-  stats.A2 += Math.floor(unknownPool * 0.2);
-  stats.unknown = 0;
+export function analyzeCEFR(text: string, table: RankTable): CEFRLevelStats {
+  const stats: CEFRLevelStats = {
+    A1: 0, A2: 0, B1: 0, B2: 0, C1: 0, C2: 0, total: 0, unique: 0,
+    estimatedLevel: 'A1',
+    words: [],
+  };
+
+  const names = findProperNouns(text, table);
+  const counts = new Map<string, number>();
+  for (const m of text.matchAll(WORD_RE)) {
+    if (names.has(m[0])) continue;
+    const word = m[0].toLowerCase().replace(/'s$/, '');
+    counts.set(word, (counts.get(word) || 0) + 1);
+  }
+
+  const words: WordInfo[] = [];
+  counts.forEach((count, word) => {
+    const level = levelOf(word, table);
+    stats[level] += count;
+    stats.total += count;
+    words.push({ word, count, level });
+  });
+  stats.unique = counts.size;
+
+  stats.estimatedLevel = 'C2';
+  let covered = 0;
+  for (const level of CEFR_LEVELS) {
+    covered += stats[level];
+    if (stats.total > 0 && covered / stats.total >= COMFORTABLE_COVERAGE) {
+      stats.estimatedLevel = level;
+      break;
+    }
+  }
+
+  stats.words = words
+    .filter(w => w.word.length >= 3)
+    .sort((a, b) => b.count - a.count || levelIndex(b.level) - levelIndex(a.level))
+    .slice(0, 2000);
 
   return stats;
 }
 
+// Share of running words at or below the reader's level.
 export function getComprehensionPercentage(stats: CEFRLevelStats, userLevel: string): number {
   if (stats.total === 0) return 0;
-  
-  const levels = ['A1', 'A2', 'B1', 'B2', 'C1'] as const;
-  const userIdx = levels.indexOf(userLevel as any);
+  const userIdx = levelIndex(userLevel);
   if (userIdx === -1) return 0;
+  let known = 0;
+  for (let i = 0; i <= userIdx; i++) known += stats[CEFR_LEVELS[i]];
+  return Math.round((known / stats.total) * 100);
+}
 
-  let understoodTokens = 0;
-  for (let i = 0; i <= userIdx; i++) {
-    const level = levels[i];
-    understoodTokens += stats[level];
-  }
-
-  // Basic comprehension boost for context
-  const basePercent = (understoodTokens / stats.total) * 100;
-  return Math.min(100, Math.round(basePercent + 5));
+// The most frequent words above the reader's level.
+export function wordsToLearn(stats: CEFRLevelStats, userLevel: string, limit = 25): WordInfo[] {
+  const userIdx = levelIndex(userLevel);
+  return stats.words.filter(w => levelIndex(w.level) > userIdx).slice(0, limit);
 }

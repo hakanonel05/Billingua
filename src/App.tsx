@@ -1,470 +1,24 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { GoogleGenAI, Type } from '@google/genai';
 import JSZip from 'jszip';
 import { del, keys } from 'idb-keyval';
 import { BookOpen, UploadCloud, Download, Loader2, CheckCircle, Layout, FileText, AlertCircle, Settings, Play, Pause, Book, Type as TypeIcon, Globe, ArrowLeft, RotateCcw, Library, Moon, Sun, Trash2, Volume2, Square, Zap, Shield, ArrowRight, Layers, X, Info, Gauge, ChevronRight, ChevronDown, Check } from 'lucide-react';
-import { saveBookToLibrary, getLibraryBooks, deleteBookFromLibrary, SavedBook } from './lib/db';
-import { analyzeCEFR, getComprehensionPercentage, CEFRLevelStats } from './lib/cefr';
+import { saveBookToLibrary, getLibraryBooks, deleteBookFromLibrary, SavedBook, loadSettings, saveSettings, savePendingJob, loadPendingJob, clearPendingJob, clearTranslationCache, PendingJob } from './lib/db';
+import { analyzeCEFR, getComprehensionPercentage, wordsToLearn, loadRankTable, frequentNames, levelOf, levelIndex, CEFRLevelStats } from './lib/cefr';
+import { XHTML_NS, resolveZipPath, parseChapterDoc, getTranslatableBlocks, highlightTerms, createSampleEpub, createPair, markLanguage, PAIR_CSS, buildGlossaryXhtml, updatePackageMetadata, addSpineItem, addToTableOfContents } from './lib/epub';
+import { translateBatch } from './lib/translate';
+import { IDIOMS, LANGUAGES } from './constants';
+import type { LayoutType, EngineType, Chapter, AppConfig, GlossaryTerm } from './types';
 
-// --- Types & Interfaces ---
-interface TranslationPayload {
-  id: number;
-  text: string;
-}
+const storedSettings = loadSettings();
 
-interface TranslationResult {
-  id: number;
-  translation: string;
-}
-
-type LayoutType = 'side-by-side' | 'interlinear' | 'replace';
-type EngineType = 'gtx' | 'gemini' | 'gtx-fallback';
-
-interface Chapter {
-  id: string;
-  title: string;
-  href: string;
-  fullPath: string;
-  selected: boolean;
-  status: 'pending' | 'processing' | 'done' | 'error';
-}
-
-interface AppConfig {
-  sourceLang: string;
-  targetLang: string;
-  layout: LayoutType;
-  engine: EngineType;
-  geminiModel: string;
-  apiKey: string;
-  buildGlossary: boolean;
-  customBg: string;
-  customColor: string;
-  minCefrLevel: 'A1' | 'B1' | 'C1';
-  extractIdioms: boolean;
-  contextualGlossary: boolean;
-  tone: 'default' | 'formal' | 'casual' | 'literary' | 'simple';
-  customGlossary: string;
-  fontFamily: string;
-  fontSize: string;
-  lineSpacing: string;
-}
-
-// --- Constants ---
-const COMMON_WORDS = new Set(['the','be','to','of','and','a','in','that','have','i','it','for','not','on','with','he','as','you','do','at','this','but','his','by','from','they','we','say','her','she','or','an','will','my','one','all','would','there','their','what','so','up','out','if','about','who','get','which','go','me','when','make','can','like','time','no','just','him','know','take','people','into','year','your','good','some','could','them','see','other','than','then','now','look','only','come','its','over','think','also','back','after','use','two','how','our','work','first','well','way','even','new','want','because','any','these','give','day','most','us','is','are','was','were','been','being','has','had','did','doing','does']);
-const IDIOMS = ['give up', 'look forward to', 'piece of cake', 'take off', 'figure out', 'carry out', 'bring up', 'catch up', 'point out', 'set up', 'turn out', 'end up', 'break down', 'find out', 'get along', 'keep on', 'make up', 'pass away', 'run out', 'show up', 'take over', 'work out', 'blessing in disguise', 'bite the bullet', 'call it a day', 'cut corners', 'get out of hand', 'hit the sack', 'miss the boat', 'under the weather', 'by the way', 'for instance', 'in terms of', 'as well as', 'sort of', 'kind of'];
-const LANGUAGES = [
-  { code: 'auto', name: 'Otomatik Algıla' },
-  { code: 'en', name: 'İngilizce' },
-  { code: 'tr', name: 'Türkçe' },
-  { code: 'es', name: 'İspanyolca' },
-  { code: 'fr', name: 'Fransızca' },
-  { code: 'de', name: 'Almanca' },
-  { code: 'it', name: 'İtalyanca' },
-  { code: 'ja', name: 'Japonca' },
-  { code: 'ru', name: 'Rusça' },
-  { code: 'zh-CN', name: 'Çince (Basitleştirilmiş)' },
-  { code: 'zh-TW', name: 'Çince (Geleneksel)' },
-  { code: 'pt', name: 'Portekizce' },
-  { code: 'ar', name: 'Arapça' },
-  { code: 'ko', name: 'Korece' },
-  { code: 'hi', name: 'Hintçe' },
-  { code: 'nl', name: 'Felemenkçe' },
-  { code: 'pl', name: 'Polonyaca' },
-  { code: 'sv', name: 'İsveççe' },
-  { code: 'no', name: 'Norveççe' },
-  { code: 'da', name: 'Danca' },
-  { code: 'fi', name: 'Fince' },
-  { code: 'el', name: 'Yunanca' },
-  { code: 'he', name: 'İbranice' },
-  { code: 'th', name: 'Tayca' },
-  { code: 'vi', name: 'Vietnamca' },
-  { code: 'id', name: 'Endonezyaca' },
-  { code: 'ms', name: 'Malayca' },
-  { code: 'ro', name: 'Romence' },
-  { code: 'hu', name: 'Macarca' },
-  { code: 'cs', name: 'Çekçe' },
-  { code: 'uk', name: 'Ukraynaca' },
-];
-
-// --- EPUB Helpers ---
-const XHTML_NS = "http://www.w3.org/1999/xhtml";
-const BLOCK_SELECTOR = "p, h1, h2, h3, h4, h5, h6, li";
-
-interface GlossaryTerm {
-  source: string;
-  target: string;
-  type: 'word' | 'idiom';
-  contextEn: string;
-  contextTr: string;
-}
-
-const escapeRegExp = (string: string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-const escapeXml = (s: string) => s
-  .replace(/&/g, '&amp;')
-  .replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;')
-  .replace(/"/g, '&quot;');
-
-const safeDecode = (s: string) => {
-  try { return decodeURIComponent(s); } catch { return s; }
-};
-
-// Resolves an OPF-relative href ("../Text/My%20Chapter.xhtml#x") to a zip path.
-const resolveZipPath = (zip: JSZip, baseDir: string, href: string): string => {
-  const normalize = (p: string) => {
-    const out: string[] = [];
-    for (const part of p.split('/')) {
-      if (part === '..') out.pop();
-      else if (part !== '.' && part !== '') out.push(part);
-    }
-    return out.join('/');
-  };
-  const withoutFragment = href.split('#')[0];
-  const decoded = normalize(baseDir + safeDecode(withoutFragment));
-  if (zip.file(decoded)) return decoded;
-  const raw = normalize(baseDir + withoutFragment);
-  return zip.file(raw) ? raw : decoded;
-};
-
-// Parses chapter content as XHTML, falling back to the HTML parser for files that are not well-formed XML.
-const parseChapterDoc = (content: string): Document => {
-  const parser = new DOMParser();
-  const xmlDoc = parser.parseFromString(content, "application/xhtml+xml");
-  if (xmlDoc.body && xmlDoc.getElementsByTagName("parsererror").length === 0) return xmlDoc;
-  return parser.parseFromString(content, "text/html");
-};
-
-// Outermost translatable blocks only, so `li > p` is translated once and never inside the nav.
-const getTranslatableBlocks = (doc: Document): Element[] =>
-  Array.from(doc.querySelectorAll(BLOCK_SELECTOR))
-    .filter(el => !el.parentElement?.closest(BLOCK_SELECTOR) && !el.closest('nav'));
-
-// Wraps glossary terms found in the text nodes of `root` in highlight spans. Works on the DOM
-// (never on serialized HTML) so markup and attributes can't be matched. Returns the terms found.
-const highlightTerms = (root: Element, terms: GlossaryTerm[], field: 'source' | 'target'): Set<GlossaryTerm> => {
-  const found = new Set<GlossaryTerm>();
-  const usable = terms.filter(t => t[field] && t[field].length >= 3);
-  if (usable.length === 0) return found;
-
-  const doc = root.ownerDocument;
-  const alternatives = usable.map(t => `(${escapeRegExp(t[field])})`).join('|');
-  // Source terms match whole words; target terms may carry Turkish suffixes.
-  const tail = field === 'source' ? '(?![\\p{L}\\p{N}])' : '\\p{L}*';
-  const regex = new RegExp(`(?<![\\p{L}\\p{N}])(?:${alternatives})${tail}`, 'giu');
-
-  const textNodes: Text[] = [];
-  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  while (walker.nextNode()) textNodes.push(walker.currentNode as Text);
-
-  for (const node of textNodes) {
-    const text = node.data;
-    const frag = doc.createDocumentFragment();
-    let last = 0;
-    let match: RegExpExecArray | null;
-    regex.lastIndex = 0;
-    while ((match = regex.exec(text))) {
-      const term = usable[match.slice(1).findIndex(g => g !== undefined)];
-      found.add(term);
-      if (match.index > last) frag.appendChild(doc.createTextNode(text.slice(last, match.index)));
-      const span = doc.createElementNS(XHTML_NS, 'span');
-      span.setAttribute('style', term.type === 'idiom' ? 'color: #2563eb; font-weight: bold;' : 'font-weight: bold;');
-      span.textContent = match[0];
-      frag.appendChild(span);
-      last = match.index + match[0].length;
-    }
-    if (last === 0) continue;
-    if (last < text.length) frag.appendChild(doc.createTextNode(text.slice(last)));
-    node.parentNode?.replaceChild(frag, node);
-  }
-  return found;
-};
-
-// --- Translation Engine ---
-async function translateWithGemini(texts: TranslationPayload[], config: AppConfig): Promise<TranslationResult[]> {
-  const ai = new GoogleGenAI({ apiKey: config.apiKey });
-  const response = await ai.models.generateContent({
-    model: config.geminiModel || 'gemini-3-flash-preview',
-    contents: `Translate the following texts from ${config.sourceLang === 'auto' ? 'the detected language' : config.sourceLang} into ${config.targetLang}. Maintain the exact same IDs in your response.\n\n${JSON.stringify(texts)}`,
-    config: {
-      systemInstruction: `You are a professional book translator. Translate the given JSON array of texts. Maintain literary tone for fiction, and clear tone for non-fiction. Never change the IDs.${config.tone !== 'default' ? ` Use a ${config.tone} tone for the translation.` : ''}${config.customGlossary ? `\n\nUse the following custom glossary rules:\n${config.customGlossary}` : ''}`,
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            id: { type: Type.NUMBER },
-            translation: { type: Type.STRING }
-          },
-          required: ["id", "translation"]
-        }
-      }
-    }
-  });
-  
-  if (response.text) {
-    let text = response.text.trim();
-    if (text.startsWith('```json')) text = text.replace(/^```json\n/, '').replace(/\n```$/, '');
-    if (text.startsWith('```')) text = text.replace(/^```\n/, '').replace(/\n```$/, '');
-    return JSON.parse(text);
-  }
-  throw new Error("Empty response from Gemini");
-}
-
-async function translateBatch(texts: TranslationPayload[], config: AppConfig, pauseRef: React.MutableRefObject<boolean>): Promise<TranslationResult[]> {
-  const results: TranslationResult[] = [];
-  let geminiOutOfQuota = false;
-  
-  if (config.engine === 'gemini' && config.apiKey) {
-    try {
-      return await translateWithGemini(texts, config);
-    } catch (err: any) {
-      console.error("Gemini API Error, falling back to GTX", err);
-      const errMsg = err?.message || String(err);
-      if (errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('RESOURCE_EXHAUSTED')) {
-        geminiOutOfQuota = true;
-      }
-      // DO NOT THROW. Fallback to GTX.
-    }
-  }
-
-  // Fallback or Default: Google Translate via Proxy (batchexecute)
-  // Check if we are potentially on a static host like Netlify where /api might 404
-  const isStaticHost = window.location.hostname.includes('netlify.app') || 
-                       window.location.hostname.includes('github.io') ||
-                       window.location.hostname.includes('vercel.app');
-
-  if (config.engine === 'gtx' && isStaticHost) {
-    console.warn("Detected static host. Client-side Google Translate (GTX) might fail due to CORS. Gemini is recommended for static hosts.");
-  }
-  const MAX_CHARS = 2000;
-  const chunks: TranslationPayload[][] = [];
-  let currentChunk: TranslationPayload[] = [];
-  let currentCharCount = 0;
-
-  for (const item of texts) {
-    const itemLen = item.text.length + 10; // +10 for delimiter
-    if (currentCharCount + itemLen > MAX_CHARS && currentChunk.length > 0) {
-      chunks.push(currentChunk);
-      currentChunk = [item];
-      currentCharCount = itemLen;
-    } else {
-      currentChunk.push(item);
-      currentCharCount += itemLen;
-    }
-  }
-  if (currentChunk.length > 0) {
-    chunks.push(currentChunk);
-  }
-
-  for (const chunk of chunks) {
-    const combinedText = chunk.map(t => t.text).join('\n\n|||\n\n');
-    
-    let success = false;
-    let isRateLimited = false;
-    let retries = 0;
-    const MAX_RETRIES = 2;
-
-    while (!success && retries <= MAX_RETRIES) {
-      try {
-        if (pauseRef.current) break;
-        
-        let response;
-        try {
-          response = await fetch('/api/process-text', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: combinedText, targetLang: config.targetLang, sourceLang: config.sourceLang })
-          });
-        } catch (fetchErr) {
-          console.error("Proxy fetch failed, will try direct gtx", fetchErr);
-        }
-        
-        if (response && response.ok) {
-          const data = await response.json();
-          const translatedCombined = data.translation || '';
-          
-          // Improved delimiter splitting: handle various whitespace and potential Google Translate artifacts
-          const translatedParts = translatedCombined.split(/(?:\s*\|\|\|\s*)+/).filter(p => p.trim() !== '');
-          
-          if (translatedParts.length === chunk.length) {
-            chunk.forEach((item, idx) => {
-              results.push({ id: item.id, translation: translatedParts[idx].trim() || item.text });
-            });
-            success = true;
-            await new Promise(r => setTimeout(r, 300)); // Small delay after success to avoid rate limits
-          } else {
-            console.warn(`Delimiter mismatch in batch translation (expected ${chunk.length}, got ${translatedParts.length}), retry ${retries}/${MAX_RETRIES}`);
-          }
-        } else if (!response || response.status === 404 || response.status === 502) {
-          // Fallback to DIRECT Google Translate if proxy is missing (Netlify 404)
-          console.log("Proxy missing or 404. Attempting direct client-side Google Translate...");
-          const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${config.sourceLang}&tl=${config.targetLang}&dt=t&q=${encodeURIComponent(combinedText)}`;
-          const directRes = await fetch(url);
-          if (directRes.ok) {
-            const data = await directRes.json();
-            let translatedDirect = '';
-            if (data && data[0]) {
-              data[0].forEach((s: any) => { if (s[0]) translatedDirect += s[0]; });
-            }
-            
-            const translatedParts = translatedDirect.split(/(?:\s*\|\|\|\s*)+/).filter(p => p.trim() !== '');
-            if (translatedParts.length === chunk.length) {
-              chunk.forEach((item, idx) => {
-                results.push({ id: item.id, translation: translatedParts[idx].trim() || item.text });
-              });
-              success = true;
-            }
-          }
-        } else {
-          console.warn(`Proxy API returned ${response.status}, retry ${retries}/${MAX_RETRIES}`);
-          if (response.status === 429) {
-            isRateLimited = true;
-            await new Promise(r => setTimeout(r, 1000 * (retries + 1))); // Exponential backoff
-          }
-        }
-      } catch (err) {
-        console.error("Batch translation error", err);
-      }
-      
-      if (success) break;
-      retries++;
-      if (retries <= MAX_RETRIES) {
-        await new Promise(r => setTimeout(r, 500)); // Short wait before retry
-      }
-    }
-
-    if (!success) {
-      if (isRateLimited) {
-        console.log("Rate limited by Google Translate. Waiting before fallback...");
-        await new Promise(r => setTimeout(r, 2000));
-      }
-
-      // If batch fails, and we have gtx-fallback enabled, try Gemini for the whole chunk
-      if (config.engine === 'gtx-fallback' && config.apiKey && !geminiOutOfQuota) {
-        try {
-          console.log("Batch failed, falling back to Gemini for chunk...");
-          const geminiResults = await translateWithGemini(chunk, config);
-          results.push(...geminiResults);
-          continue; // Skip sequential if Gemini succeeds
-        } catch (geminiErr: any) {
-          console.error("Gemini fallback also failed, trying sequential", geminiErr);
-          const errMsg = geminiErr?.message || String(geminiErr);
-          if (errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('RESOURCE_EXHAUSTED')) {
-            geminiOutOfQuota = true;
-          }
-        }
-      }
-
-      // Fallback to sequential individual requests
-      for (const item of chunk) {
-        let itemSuccess = false;
-        let itemRetries = 0;
-        const MAX_ITEM_RETRIES = 2;
-
-        while (!itemSuccess && itemRetries <= MAX_ITEM_RETRIES) {
-          try {
-            const response = await fetch('/api/process-text', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ text: item.text, targetLang: config.targetLang, sourceLang: config.sourceLang })
-            });
-            if (response.ok) {
-              const data = await response.json();
-              results.push({ id: item.id, translation: (data.translation || '').trim() || item.text });
-              itemSuccess = true;
-            } else if (response.status === 429) {
-               await new Promise(r => setTimeout(r, 1000 * (itemRetries + 1)));
-            }
-          } catch (e) {
-            console.error(`Sequential error (retry ${itemRetries})`, e);
-          }
-          if (itemSuccess) break;
-          itemRetries++;
-          if (itemRetries <= MAX_ITEM_RETRIES) {
-            await new Promise(r => setTimeout(r, 300));
-          }
-        }
-        
-        if (!itemSuccess) {
-          // If sequential fails, and we have gtx-fallback enabled, try Gemini for this single item
-          if (config.engine === 'gtx-fallback' && config.apiKey && !geminiOutOfQuota) {
-            try {
-              const geminiResult = await translateWithGemini([item], config);
-              if (geminiResult && geminiResult.length > 0) {
-                results.push(geminiResult[0]);
-                itemSuccess = true;
-              }
-            } catch (geminiErr: any) {
-              console.error("Gemini single fallback failed", geminiErr);
-              const errMsg = geminiErr?.message || String(geminiErr);
-              if (errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('RESOURCE_EXHAUSTED')) {
-                geminiOutOfQuota = true;
-              }
-            }
-          }
-          
-          if (!itemSuccess) {
-            results.push({ id: item.id, translation: item.text }); // Ultimate fallback: original text
-          }
-        }
-        await new Promise(r => setTimeout(r, 100)); // Minimal delay for speed
-      }
-    } else {
-      await new Promise(r => setTimeout(r, 500)); // Increased from 200 to avoid 500 errors
-    }
-  }
-  return results;
-}
-
-// --- Sample EPUB Generator ---
-const createSampleEpub = async (): Promise<File> => {
-  const zip = new JSZip();
-  zip.file("mimetype", "application/epub+zip");
-  
-  const containerXml = `<?xml version="1.0"?>
-  <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
-    <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
-  </container>`;
-  zip.file("META-INF/container.xml", containerXml);
-  
-  const contentOpf = `<?xml version="1.0" encoding="UTF-8"?>
-  <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id">
-    <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-      <dc:title>Moby Dick (Sample)</dc:title>
-      <dc:language>en</dc:language>
-      <dc:identifier id="pub-id">urn:uuid:12345</dc:identifier>
-    </metadata>
-    <manifest>
-      <item id="chapter1" href="chapter1.html" media-type="application/xhtml+xml"/>
-      <item id="chapter2" href="chapter2.html" media-type="application/xhtml+xml"/>
-      <item id="chapter3" href="chapter3.html" media-type="application/xhtml+xml"/>
-    </manifest>
-    <spine>
-      <itemref idref="chapter1"/>
-      <itemref idref="chapter2"/>
-      <itemref idref="chapter3"/>
-    </spine>
-  </package>`;
-  zip.file("OEBPS/content.opf", contentOpf);
-  
-  const ch1 = `<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 1: Loomings</title></head><body><h1>Chapter 1: Loomings</h1><p>Call me Ishmael. Some years ago—never mind how long precisely—having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world.</p><p>It is a way I have of driving off the spleen and regulating the circulation.</p></body></html>`;
-  const ch2 = `<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 2: The Carpet-Bag</title></head><body><h1>Chapter 2: The Carpet-Bag</h1><p>I stuffed a shirt or two into my old carpet-bag, tucked it under my arm, and started for Cape Horn and the Pacific. Quitting the good city of old Manhatto, I duly arrived in New Bedford.</p><p>It was a Saturday night in December.</p></body></html>`;
-  const ch3 = `<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 3: The Spouter-Inn</title></head><body><h1>Chapter 3: The Spouter-Inn</h1><p>Entering that gable-ended Spouter-Inn, you found yourself in a wide, low, straggling entry with old-fashioned wainscots, reminding one of the bulwarks of some condemned old craft.</p><p>On one side hung a very large oilpainting so thoroughly besmoked, and every way defaced, that in the unequal crosslights by which you viewed it, it was only by diligent study that you could any way arrive at an understanding of its purpose.</p></body></html>`;
-  
-  zip.file("OEBPS/chapter1.html", ch1);
-  zip.file("OEBPS/chapter2.html", ch2);
-  zip.file("OEBPS/chapter3.html", ch3);
-  
-  const blob = await zip.generateAsync({ type: "blob", mimeType: "application/epub+zip" });
-  return new File([blob], "Moby_Dick_Sample.epub", { type: "application/epub+zip" });
-};
+const BATCH_SIZE = 10;        // paragraphs per translation request
+const PARALLEL_BATCHES = 3;   // requests in flight at once
+const CONTEXT_PARAGRAPHS = 3; // preceding paragraphs sent to Gemini as context
 
 // --- Main App Component ---
 export default function App() {
   const [currentView, setCurrentView] = useState<'home' | 'translator' | 'library'>('home');
-  const [isDarkMode, setIsDarkMode] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(() => storedSettings.isDarkMode ?? false);
   const [libraryBooks, setLibraryBooks] = useState<SavedBook[]>([]);
 
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
@@ -473,7 +27,7 @@ export default function App() {
   const [opfPath, setOpfPath] = useState<string>('');
   
   const [chapters, setChapters] = useState<Chapter[]>([]);
-  const [config, setConfig] = useState<AppConfig>({
+  const [config, setConfig] = useState<AppConfig>(() => ({
     sourceLang: 'auto',
     targetLang: 'tr',
     layout: 'side-by-side',
@@ -490,8 +44,9 @@ export default function App() {
     customGlossary: '',
     fontFamily: 'sans-serif',
     fontSize: '1em',
-    lineSpacing: '1.5'
-  });
+    lineSpacing: '1.5',
+    ...storedSettings.config,
+  }));
   
   const [progress, setProgress] = useState({ current: 0, total: 0, chapterTitle: '' });
   const [isPaused, setIsPaused] = useState(false);
@@ -504,7 +59,7 @@ export default function App() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   
   const [cefrStats, setCefrStats] = useState<CEFRLevelStats | null>(null);
-  const [userLevel, setUserLevel] = useState<string>('B1');
+  const [userLevel, setUserLevel] = useState<string>(() => storedSettings.userLevel ?? 'B1');
   const [showTopWords, setShowTopWords] = useState(false);
   
   const [dictionaryWord, setDictionaryWord] = useState<string | null>(null);
@@ -513,6 +68,18 @@ export default function App() {
   const [dictionaryPos, setDictionaryPos] = useState({ x: 0, y: 0 });
 
   const glossaryTermsRef = useRef<GlossaryTerm[]>([]);
+  const bookNamesRef = useRef<string[]>([]);
+  const [pendingJob, setPendingJob] = useState<PendingJob | null>(null);
+
+  useEffect(() => {
+    saveSettings({ config, isDarkMode, userLevel });
+  }, [config, isDarkMode, userLevel]);
+
+  useEffect(() => {
+    if (currentView === 'translator' && step === 1) {
+      loadPendingJob().then(job => setPendingJob(job ?? null));
+    }
+  }, [currentView, step]);
 
   useEffect(() => {
     if (isDarkMode) {
@@ -570,7 +137,8 @@ export default function App() {
   };
 
   // --- Step 1: File Upload & Parsing ---
-  const handleFile = async (uploadedFile: File) => {
+  // `selectedChapterIds` restores the chapter selection of a resumed job.
+  const handleFile = async (uploadedFile: File, selectedChapterIds?: string[]) => {
     setFile(uploadedFile);
     setErrorMsg('');
     try {
@@ -678,7 +246,7 @@ export default function App() {
               title,
               href,
               fullPath,
-              selected: true,
+              selected: selectedChapterIds ? selectedChapterIds.includes(idref || '') : true,
               status: 'pending'
             });
           }
@@ -688,10 +256,11 @@ export default function App() {
       setChapters(parsedChapters);
       setPreviews(initialPreviews);
       
-      // Perform CEFR analysis on clean text
-      const fullTextSample = analysisTextParts.join(' ').substring(0, 200000);
-      const stats = analyzeCEFR(fullTextSample);
-      setCefrStats(stats);
+      // CEFR analysis and recurring names (kept unchanged by Gemini) from the clean text
+      const fullTextSample = analysisTextParts.join(' ').substring(0, 500000);
+      const rankTable = await loadRankTable();
+      setCefrStats(analyzeCEFR(fullTextSample, rankTable));
+      bookNamesRef.current = frequentNames(fullTextSample, rankTable);
       
       if (parsedChapters.length > 0) {
         setActivePreviewId(parsedChapters[0].id);
@@ -724,7 +293,12 @@ export default function App() {
     setProgress(p => ({ ...p, total: selectedChapters.length }));
     
     const serializer = new XMLSerializer();
-    const translationMemory = new Map<string, string>();
+
+    // Remember the job so a reload can pick it up again (finished paragraphs come from the cache)
+    if (file) {
+      savePendingJob({ fileName: file.name, file, selectedChapterIds: selectedChapters.map(c => c.id), startedAt: Date.now() });
+    }
+    const rankTable = await loadRankTable();
 
     // Phase 1: Build Glossary before translating chapters
     glossaryTermsRef.current = [];
@@ -739,16 +313,12 @@ export default function App() {
             const htmlDoc = parseChapterDoc(content);
             const text = htmlDoc.body?.textContent || '';
             
-            // Extract words
-            const words = text.match(/\b[a-zA-Z]{4,}\b/g);
+            // Extract words. Lowercase occurrences only, which leaves out names.
+            const words = text.match(/\b[a-z]{4,}\b/g);
             if (words) {
-              words.forEach(w => {
-                const lower = w.toLowerCase();
-                let isValid = false;
-                if (config.minCefrLevel === 'A1') isValid = true;
-                else if (config.minCefrLevel === 'B1') isValid = !COMMON_WORDS.has(lower) && lower.length >= 5;
-                else if (config.minCefrLevel === 'C1') isValid = !COMMON_WORDS.has(lower) && lower.length >= 7;
-                
+              const minLevel = levelIndex(config.minCefrLevel);
+              words.forEach(lower => {
+                const isValid = levelIndex(levelOf(lower, rankTable)) >= minLevel;
                 if (isValid) {
                   const current = counts.get(lower) || { count: 0, type: 'word' };
                   counts.set(lower, { count: current.count + 1, type: 'word' });
@@ -805,173 +375,140 @@ export default function App() {
     }
     
     let processedCount = chapters.filter(c => c.status === 'done').length;
+    const blockText = (el: Element) => (el.textContent || '').replace(/\s+/g, ' ').trim();
+
+    // Logic to ensure English is always on the left and Turkish on the right
+    const shouldSwap = (config.targetLang === 'en' && config.sourceLang !== 'en') ||
+                       (config.sourceLang === 'tr' && config.targetLang !== 'tr');
+
+    const applyTranslation = (htmlDoc: Document, el: Element, translation: string) => {
+      const originalText = blockText(el);
+      const isListItem = el.localName === 'li';
+
+      // The translation is plain text; it goes in as a text node, never as markup.
+      const translatedEl = isListItem
+        ? htmlDoc.createElementNS(XHTML_NS, 'div')
+        : el.cloneNode(false) as Element;
+      translatedEl.removeAttribute('id'); // keep anchors (TOC, footnotes) unique
+      translatedEl.textContent = translation;
+      markLanguage(translatedEl, config.targetLang);
+
+      const markGlossary = (sourceRoot: Element, targetRoot: Element) => {
+        if (!config.buildGlossary || glossaryTermsRef.current.length === 0) return;
+        const found = highlightTerms(sourceRoot, glossaryTermsRef.current, 'source');
+        highlightTerms(targetRoot, Array.from(found), 'target');
+        if (config.contextualGlossary) {
+          found.forEach(term => {
+            if (!term.contextEn) {
+              term.contextEn = originalText;
+              term.contextTr = translation;
+            }
+          });
+        }
+      };
+
+      if (config.layout === 'side-by-side' || config.layout === 'columns') {
+        const { container, left, right } = createPair(htmlDoc, config.layout);
+
+        // The original keeps its inline markup (italics, links, footnote refs, images).
+        // A <li> can't be wrapped in a block, so the pair goes inside it instead.
+        let originalEl: Element = el;
+        if (isListItem) {
+          originalEl = htmlDoc.createElementNS(XHTML_NS, 'div');
+          while (el.firstChild) originalEl.appendChild(el.firstChild);
+          el.appendChild(container);
+        } else {
+          el.parentNode?.insertBefore(container, el);
+        }
+        markGlossary(originalEl, translatedEl);
+
+        if (shouldSwap) {
+          left.appendChild(translatedEl);
+          right.appendChild(originalEl);
+        } else {
+          left.appendChild(originalEl);
+          right.appendChild(translatedEl);
+        }
+      }
+      else if (config.layout === 'interlinear') {
+        translatedEl.setAttribute("style", `color: ${config.customColor}; background-color: ${config.customBg}; padding: 4px 8px; border-radius: 4px; margin-top: 4px; font-size: 0.95em; display: block;`);
+        markGlossary(el, translatedEl);
+        if (isListItem) el.appendChild(translatedEl);
+        else el.parentNode?.insertBefore(translatedEl, el.nextSibling);
+      }
+      else if (config.layout === 'replace') {
+        // Collect glossary hits on a throwaway copy, then swap the text but keep images.
+        markGlossary(el.cloneNode(true) as Element, translatedEl);
+        const media = Array.from(el.querySelectorAll('img, svg')).filter(m => !m.parentElement?.closest('svg'));
+        while (el.firstChild) el.removeChild(el.firstChild);
+        media.forEach(m => el.appendChild(m));
+        while (translatedEl.firstChild) el.appendChild(translatedEl.firstChild);
+        markLanguage(el, config.targetLang);
+      }
+    };
+
+    const previewHtml = (htmlDoc: Document) =>
+      (config.layout === 'columns' ? `<style>${PAIR_CSS}</style>` : '') + htmlDoc.body.innerHTML;
 
     for (let i = 0; i < chapters.length; i++) {
       if (pauseRef.current) break;
       const chapter = chapters[i];
       if (!chapter.selected || chapter.status === 'done') continue;
-      
+
       setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'processing' } : c));
       setProgress(p => ({ ...p, current: processedCount + 1, chapterTitle: chapter.title }));
-      
+
       try {
         const content = await zipInstance.file(chapter.fullPath)?.async("text");
         if (!content) throw new Error("File content not found");
-        
+
         const htmlDoc = parseChapterDoc(content);
         const elements = getTranslatableBlocks(htmlDoc);
-        const blockText = (el: Element) => (el.textContent || '').replace(/\s+/g, ' ').trim();
-        
-        if (elements.length > 0) {
-          const BATCH_SIZE = 10; // Reduced from 15 to avoid 500 errors
-          for (let j = 0; j < elements.length; j += BATCH_SIZE) {
-            if (pauseRef.current) break;
-            const batch = elements.slice(j, j + BATCH_SIZE);
-            const payload: any[] = [];
-            const cached: any[] = [];
-            
-            batch.forEach((el, idx) => {
-              const text = blockText(el);
-              if (text.length > 0) {
-                if (translationMemory.has(text)) {
-                  cached.push({ id: idx, translation: translationMemory.get(text)! });
-                } else {
-                  payload.push({ id: idx, text });
-                }
-              }
-            });
-            
-            let translations = [...cached];
-            if (payload.length > 0) {
-              const apiTranslations = await translateBatch(payload, config, pauseRef);
-              apiTranslations.forEach(t => {
-                const originalText = payload.find(p => p.id === t.id)?.text;
-                if (originalText) translationMemory.set(originalText, t.translation);
-              });
-              translations = [...translations, ...apiTranslations];
+        const texts = elements.map(blockText);
+
+        // A few batches are translated at once; their results are applied in document order.
+        for (let start = 0; start < elements.length; start += BATCH_SIZE * PARALLEL_BATCHES) {
+          if (pauseRef.current) break;
+          const wave: number[] = [];
+          for (let b = start; b < Math.min(start + BATCH_SIZE * PARALLEL_BATCHES, elements.length); b += BATCH_SIZE) wave.push(b);
+
+          const waveResults = await Promise.all(wave.map(batchStart => {
+            const payload = [];
+            for (let k = batchStart; k < Math.min(batchStart + BATCH_SIZE, elements.length); k++) {
+              if (texts[k]) payload.push({ id: k, text: texts[k] });
             }
-              
-            batch.forEach((el, idx) => {
-              const transObj = translations.find(t => t.id === idx);
-                if (transObj && transObj.translation && transObj.translation !== payload.find(p => p.id === idx)?.text) {
-                  
-                  const originalText = blockText(el);
-                  const isListItem = el.localName === 'li';
+            if (payload.length === 0) return Promise.resolve([]);
+            const context = {
+              precedingText: texts.slice(Math.max(0, batchStart - CONTEXT_PARAGRAPHS), batchStart).filter(Boolean),
+              names: bookNamesRef.current,
+            };
+            return translateBatch(payload, config, pauseRef, context);
+          }));
+          if (pauseRef.current) break;
 
-                  // The translation is plain text; it goes in as a text node, never as markup.
-                  const translatedEl = isListItem
-                    ? htmlDoc.createElementNS(XHTML_NS, 'div')
-                    : el.cloneNode(false) as Element;
-                  translatedEl.removeAttribute('id'); // keep anchors (TOC, footnotes) unique
-                  translatedEl.textContent = transObj.translation;
+          waveResults.flat().forEach(t => applyTranslation(htmlDoc, elements[t.id], t.translation));
 
-                  const useGlossary = config.buildGlossary && glossaryTermsRef.current.length > 0;
-                  const markGlossary = (sourceRoot: Element, targetRoot: Element) => {
-                    if (!useGlossary) return;
-                    const found = highlightTerms(sourceRoot, glossaryTermsRef.current, 'source');
-                    highlightTerms(targetRoot, Array.from(found), 'target');
-                    if (config.contextualGlossary) {
-                      found.forEach(term => {
-                        if (!term.contextEn) {
-                          term.contextEn = originalText;
-                          term.contextTr = transObj.translation;
-                        }
-                      });
-                    }
-                  };
+          // --- LIVE PREVIEW UPDATE ---
+          setPreviews(prev => ({ ...prev, [chapter.id]: previewHtml(htmlDoc) }));
+          // Switch to the currently translating chapter if no preview is active
+          setActivePreviewId(prevId => prevId || chapter.id);
+        }
 
-                  if (config.layout === 'side-by-side') {
-                    const table = htmlDoc.createElementNS(XHTML_NS, "table");
-                    table.setAttribute("style", "width: 100%; border-collapse: collapse; margin-bottom: 1em; table-layout: fixed;");
-                    const tbody = htmlDoc.createElementNS(XHTML_NS, "tbody");
-                    const tr = htmlDoc.createElementNS(XHTML_NS, "tr");
-                    
-                    const tdLeft = htmlDoc.createElementNS(XHTML_NS, "td");
-                    tdLeft.setAttribute("style", "width: 50%; padding-right: 2%; vertical-align: top; border-right: 1px solid #ccc;");
-                    
-                    const tdRight = htmlDoc.createElementNS(XHTML_NS, "td");
-                    tdRight.setAttribute("style", "width: 50%; padding-left: 2%; vertical-align: top;");
-                    
-                    // The original keeps its inline markup (italics, links, footnote refs, images).
-                    // A <li> can't be wrapped in a table, so the table goes inside it instead.
-                    let originalEl: Element = el;
-                    if (isListItem) {
-                      originalEl = htmlDoc.createElementNS(XHTML_NS, 'div');
-                      while (el.firstChild) originalEl.appendChild(el.firstChild);
-                      el.appendChild(table);
-                    } else {
-                      el.parentNode?.insertBefore(table, el);
-                    }
-                    markGlossary(originalEl, translatedEl);
-                    
-                    // Logic to ensure English is always on the left and Turkish on the right
-                    const shouldSwap = (config.targetLang === 'en' && config.sourceLang !== 'en') || 
-                                     (config.sourceLang === 'tr' && config.targetLang !== 'tr');
-
-                    if (shouldSwap) {
-                      tdLeft.appendChild(translatedEl);
-                      tdRight.appendChild(originalEl);
-                    } else {
-                      tdLeft.appendChild(originalEl);
-                      tdRight.appendChild(translatedEl);
-                    }
-
-                    tr.appendChild(tdLeft);
-                    tr.appendChild(tdRight);
-                    tbody.appendChild(tr);
-                    table.appendChild(tbody);
-                  } 
-                  else if (config.layout === 'interlinear') {
-                    translatedEl.setAttribute("style", `color: ${config.customColor}; background-color: ${config.customBg}; padding: 4px 8px; border-radius: 4px; margin-top: 4px; font-size: 0.95em; display: block;`);
-                    markGlossary(el, translatedEl);
-                    if (isListItem) el.appendChild(translatedEl);
-                    else el.parentNode?.insertBefore(translatedEl, el.nextSibling);
-                  }
-                  else if (config.layout === 'replace') {
-                    // Collect glossary hits on a throwaway copy, then swap the text but keep images.
-                    markGlossary(el.cloneNode(true) as Element, translatedEl);
-                    const media = Array.from(el.querySelectorAll('img, svg')).filter(m => !m.parentElement?.closest('svg'));
-                    while (el.firstChild) el.removeChild(el.firstChild);
-                    media.forEach(m => el.appendChild(m));
-                    while (translatedEl.firstChild) el.appendChild(translatedEl.firstChild);
-                  }
-                }
-              });
-              
-              // --- LIVE PREVIEW UPDATE ---
-              if (!pauseRef.current) {
-                // For preview, we only want the body content to avoid <html>/<body> tags inside our preview div
-                const previewHtml = htmlDoc.body.innerHTML;
-                setPreviews(prev => {
-                  const newPreviews = { ...prev, [chapter.id]: previewHtml };
-                  return newPreviews;
-                });
-                // Switch to the currently translating chapter if no preview is active
-                setActivePreviewId(prevId => prevId || chapter.id);
-              }
-            }
-          }
-        
         if (!pauseRef.current) {
-          const styleEl = htmlDoc.createElementNS("http://www.w3.org/1999/xhtml", "style");
+          const styleEl = htmlDoc.createElementNS(XHTML_NS, "style");
           styleEl.textContent = `
             body {
               font-family: ${config.fontFamily} !important;
               font-size: ${config.fontSize} !important;
               line-height: ${config.lineSpacing} !important;
             }
+            ${config.layout === 'columns' ? PAIR_CSS : ''}
           `;
           htmlDoc.head?.appendChild(styleEl);
 
-          const finalHtml = serializer.serializeToString(htmlDoc);
-          zipInstance.file(chapter.fullPath, finalHtml);
-          
-          // Final preview update for this chapter
-          const finalPreviewHtml = htmlDoc.body.innerHTML;
-          setPreviews(prev => {
-            const newPreviews = { ...prev, [chapter.id]: finalPreviewHtml };
-            return newPreviews;
-          });
+          zipInstance.file(chapter.fullPath, serializer.serializeToString(htmlDoc));
+
+          setPreviews(prev => ({ ...prev, [chapter.id]: previewHtml(htmlDoc) }));
           setActivePreviewId(prevId => prevId || chapter.id);
           setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'done' } : c));
           processedCount++;
@@ -981,7 +518,7 @@ export default function App() {
         setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'error' } : c));
       }
     }
-    
+
     if (!pauseRef.current) {
       await finalizeBook();
     }
@@ -989,73 +526,37 @@ export default function App() {
 
   const finalizeBook = async () => {
     if (!zipInstance) return;
-    
-    // Build Glossary if enabled
-    if (config.buildGlossary && glossaryTermsRef.current.length > 0) {
-      setProgress(p => ({ ...p, chapterTitle: 'Finalizing Glossary...' }));
-      
-      let glossaryHtml = `<?xml version="1.0" encoding="UTF-8"?>
-      <html xmlns="http://www.w3.org/1999/xhtml">
-      <head><title>Glossary</title></head>
-      <body style="font-family: sans-serif;">
-        <h1>Glossary / Sözlük</h1>
-        <p>Important vocabulary and idioms found in this book:</p>
-        <ul style="line-height: 1.8;">`;
-        
-      glossaryTermsRef.current.forEach(term => {
-        const style = term.type === 'idiom' ? 'color: #2563eb;' : '';
-        glossaryHtml += `<li style="margin-bottom: 12px;">
-          <strong style="${style}">${escapeXml(term.source)}</strong>: ${escapeXml(term.target)}`;
-          
-        if (config.contextualGlossary && term.contextEn) {
-          glossaryHtml += `<br/>
-          <em style="color: #555; font-size: 0.9em;">"${escapeXml(term.contextEn)}"</em><br/>
-          <em style="color: #777; font-size: 0.9em;">"${escapeXml(term.contextTr)}"</em>`;
-        }
-        
-        glossaryHtml += `</li>`;
-      });
-      glossaryHtml += `</ul></body></html>`;
-      
-      const basePath = opfPath.substring(0, opfPath.lastIndexOf('/') + 1);
-      zipInstance.file(`${basePath}glossary.html`, glossaryHtml);
-      
-      // Update OPF
-      try {
-        const opfContent = await zipInstance.file(opfPath)?.async("text");
-        if (opfContent) {
-          const parser = new DOMParser();
-          const serializer = new XMLSerializer();
-          const opfDoc = parser.parseFromString(opfContent, "application/xml");
-          
-          const manifest = opfDoc.querySelector("manifest");
-          const spine = opfDoc.querySelector("spine");
-          
-          const alreadyListed = Array.from(opfDoc.querySelectorAll("manifest > item")).some(i => i.getAttribute("id") === "auto-glossary");
-          if (manifest && spine && !alreadyListed) {
-            const item = opfDoc.createElementNS(manifest.namespaceURI, "item");
-            item.setAttribute("id", "auto-glossary");
-            item.setAttribute("href", "glossary.html");
-            item.setAttribute("media-type", "application/xhtml+xml");
-            manifest.appendChild(item);
-            
-            const itemref = opfDoc.createElementNS(spine.namespaceURI, "itemref");
-            itemref.setAttribute("idref", "auto-glossary");
-            spine.appendChild(itemref);
-            
-            zipInstance.file(opfPath, serializer.serializeToString(opfDoc));
-          }
-        }
-      } catch (e) {
-        console.error("Failed to update OPF with glossary", e);
-      }
-      
+    setProgress(p => ({ ...p, chapterTitle: 'Kitap paketleniyor...' }));
+
+    const hasGlossary = config.buildGlossary && glossaryTermsRef.current.length > 0;
+    const basePath = opfPath.substring(0, opfPath.lastIndexOf('/') + 1);
+    const glossaryPath = `${basePath}glossary.html`;
+
+    if (hasGlossary) {
+      const glossaryHtml = buildGlossaryXhtml(glossaryTermsRef.current, config.contextualGlossary);
+      zipInstance.file(glossaryPath, glossaryHtml);
       setPreviews(prev => ({ ...prev, 'auto-glossary': glossaryHtml }));
     }
-    
+
+    // Package metadata (languages, title) and the glossary's place in the spine and TOC
+    try {
+      const opfContent = await zipInstance.file(opfPath)?.async("text");
+      if (opfContent) {
+        const opfDoc = new DOMParser().parseFromString(opfContent, "application/xml");
+        updatePackageMetadata(opfDoc, { sourceLang: config.sourceLang, targetLang: config.targetLang, layout: config.layout });
+        if (hasGlossary) {
+          addSpineItem(opfDoc, 'auto-glossary', 'glossary.html');
+          await addToTableOfContents(zipInstance, opfPath, opfDoc, glossaryPath, 'Sözlük / Glossary', 'auto-glossary');
+        }
+        zipInstance.file(opfPath, new XMLSerializer().serializeToString(opfDoc));
+      }
+    } catch (e) {
+      console.error("Failed to update the package document", e);
+    }
+
     const blob = await zipInstance.generateAsync({ type: "blob", mimeType: "application/epub+zip" });
     setFinalBlob(blob);
-    
+
     // Save to library
     const bookTitle = file?.name.replace('.epub', '') || 'Translated_Book';
     const savedBook: SavedBook = {
@@ -1067,6 +568,7 @@ export default function App() {
       targetLang: config.targetLang
     };
     await saveBookToLibrary(savedBook);
+    await clearPendingJob();
 
     setStep(4);
   };
@@ -1389,6 +891,31 @@ export default function App() {
               <p className={`text-lg ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Süreci başlatmak için EPUB dosyanızı yükleyin.</p>
             </div>
 
+            {pendingJob && (
+              <div className={`w-full flex flex-col sm:flex-row sm:items-center gap-4 p-5 rounded-2xl border ${isDarkMode ? 'bg-amber-900/20 border-amber-800/50' : 'bg-amber-50 border-amber-200'}`}>
+                <RotateCcw className="w-6 h-6 text-amber-600 shrink-0" />
+                <div className="flex-1">
+                  <p className={`font-semibold ${isDarkMode ? 'text-amber-200' : 'text-amber-900'}`}>Yarım kalan bir çeviri var: {pendingJob.fileName}</p>
+                  <p className={`text-sm ${isDarkMode ? 'text-amber-300/70' : 'text-amber-800/80'}`}>Devam ederseniz daha önce çevrilen paragraflar yeniden çevrilmez, önbellekten gelir.</p>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => handleFile(new File([pendingJob.file], pendingJob.fileName, { type: 'application/epub+zip' }), pendingJob.selectedChapterIds)}
+                    className="px-4 py-2 rounded-lg bg-amber-600 text-white font-medium hover:bg-amber-700 transition-colors"
+                  >
+                    Devam Et
+                  </button>
+                  <button
+                    onClick={async () => { await clearPendingJob(); setPendingJob(null); }}
+                    className={`px-4 py-2 rounded-lg font-medium transition-colors ${isDarkMode ? 'text-amber-200 hover:bg-amber-900/40' : 'text-amber-800 hover:bg-amber-100'}`}
+                  >
+                    Vazgeç
+                  </button>
+                </div>
+              </div>
+            )}
+
+
             <div 
               onDragOver={(e) => e.preventDefault()} 
               onDrop={(e) => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }}
@@ -1449,7 +976,7 @@ export default function App() {
                         <div>
                           <h3 className={`text-lg font-bold ${isDarkMode ? 'text-slate-100' : 'text-slate-800'}`}>Kitap Zorluk Analizi</h3>
                           <p className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-                            {cefrStats.total.toLocaleString()} kelime • {cefrStats.unique.toLocaleString()} benzersiz • Tahmini seviye: <strong>{cefrStats.B2 > cefrStats.B1 ? 'B2' : 'B1'}</strong>
+                            {cefrStats.total.toLocaleString()} kelime • {cefrStats.unique.toLocaleString()} benzersiz • Rahat okuma seviyesi: <strong>{cefrStats.estimatedLevel}</strong>
                           </p>
                         </div>
                       </div>
@@ -1465,6 +992,7 @@ export default function App() {
                           <option value="B1">B1</option>
                           <option value="B2">B2</option>
                           <option value="C1">C1</option>
+                          <option value="C2">C2</option>
                         </select>
                       </div>
                     </div>
@@ -1475,6 +1003,7 @@ export default function App() {
                       <div style={{ width: `${(cefrStats.B1 / cefrStats.total) * 100}%` }} className="bg-[#f59e0b] h-full flex items-center justify-center text-[8px] font-bold text-white border-l border-white/20">B1 {Math.round((cefrStats.B1 / cefrStats.total) * 100)}%</div>
                       <div style={{ width: `${(cefrStats.B2 / cefrStats.total) * 100}%` }} className="bg-[#f97316] h-full flex items-center justify-center text-[8px] font-bold text-white border-l border-white/20">B2 {Math.round((cefrStats.B2 / cefrStats.total) * 100)}%</div>
                       <div style={{ width: `${(cefrStats.C1 / cefrStats.total) * 100}%` }} className="bg-[#ef4444] h-full flex items-center justify-center text-[8px] font-bold text-white border-l border-white/20">C1 {Math.round((cefrStats.C1 / cefrStats.total) * 100)}%</div>
+                      <div style={{ width: `${(cefrStats.C2 / cefrStats.total) * 100}%` }} className="bg-[#b91c1c] h-full flex items-center justify-center text-[8px] font-bold text-white border-l border-white/20">C2 {Math.round((cefrStats.C2 / cefrStats.total) * 100)}%</div>
                     </div>
 
                     <div className={`p-4 rounded-xl flex items-center gap-3 ${isDarkMode ? 'bg-slate-800/80 border border-slate-700' : 'bg-white border border-slate-100 shadow-sm'}`}>
@@ -1489,12 +1018,12 @@ export default function App() {
                       className={`mt-4 w-full flex items-center gap-2 text-sm font-semibold transition-colors ${isDarkMode ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'}`}
                     >
                       {showTopWords ? <ChevronDown className="w-4 h-4 text-pink-500" /> : <ChevronRight className="w-4 h-4 text-pink-500" />}
-                      <span>🎯 Öğrenilmesi Önerilen En Sık 25 Zor Kelime</span>
+                      <span>🎯 Seviyenin Üstündeki En Sık 25 Kelime</span>
                     </button>
-                    {showTopWords && cefrStats.topDifficultWords && (
+                    {showTopWords && (
                       <div className="mt-3 flex flex-wrap gap-2 animate-fade-in">
-                        {cefrStats.topDifficultWords.map((w, i) => {
-                          const isC = w.level === 'C1' || w.level === 'unknown';
+                        {wordsToLearn(cefrStats, userLevel).map((w, i) => {
+                          const isC = w.level === 'C1' || w.level === 'C2';
                           const isB = w.level === 'B2' || w.level === 'B1';
                           
                           const colorClass = isC 
@@ -1506,7 +1035,7 @@ export default function App() {
                           return (
                             <div key={i} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all border shadow-sm flex items-center gap-1.5 ${colorClass}`}>
                               <span>{w.word}</span>
-                              <span className="text-[10px] opacity-60 font-mono">×{w.count}</span>
+                              <span className="text-[10px] opacity-60 font-mono">{w.level} ×{w.count}</span>
                             </div>
                           );
                         })}
@@ -1516,7 +1045,7 @@ export default function App() {
                     <div className={`mt-4 flex items-start gap-2 p-3 rounded-lg ${isDarkMode ? 'bg-slate-900/50' : 'bg-slate-50'}`}>
                       <span className="text-sm">💡</span>
                       <p className={`text-[11px] leading-relaxed ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-                        Kelimelerin yanındaki sayı kitaptaki sıklığı gösterir. Renkler CEFR zorluk seviyesini temsil eder (Turuncu=B-Seviyesi, Kırmızı=C-Seviyesi veya Bilinmeyen).
+                        Seviyeler, kelimenin İngilizcedeki kullanım sıklığına göre tahmin edilir (en sık 700 kelime A1, 1500 A2, 3000 B1, 5000 B2, 10.000 C1, ötesi C2). Özel isimler hesaba katılmaz. Rahat okuma için metindeki kelimelerin yaklaşık %95'ini bilmek gerekir. Kelimelerin yanındaki sayı kitaptaki sıklığı gösterir.
                       </p>
                     </div>
                   </div>
@@ -1601,16 +1130,17 @@ export default function App() {
                           placeholder="API anahtarınızı girin..."
                           className={`w-full border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-900 border-slate-700 text-white placeholder-slate-500' : 'bg-slate-50 border-slate-300 focus:bg-white placeholder-slate-400'}`}
                         />
-                        <p className={`text-xs ${isDarkMode ? 'text-slate-500' : 'text-slate-500'}`}>Anahtarınız sadece yerel olarak kullanılır ve asla kaydedilmez.</p>
+                        <p className={`text-xs ${isDarkMode ? 'text-slate-500' : 'text-slate-500'}`}>Anahtarınız yalnızca bu tarayıcıda saklanır ve doğrudan Google'a gönderilir. "Tüm Verileri Sıfırla" ile silebilirsiniz.</p>
                       </div>
                     </>
                   )}
 
                   <div className="md:col-span-2 space-y-3">
                     <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Sayfa Düzeni</label>
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                       {[
-                        { id: 'side-by-side', name: 'Yan Yana', desc: 'Orijinal sol, çeviri sağ tarafta', icon: Layout },
+                        { id: 'side-by-side', name: 'Yan Yana (Tablo)', desc: 'Orijinal sol, çeviri sağda. Eski Kindle dahil her okuyucuda çalışır', icon: Layout },
+                        { id: 'columns', name: 'Yan Yana (Mobil Uyumlu)', desc: 'Geniş ekranda yan yana, telefonda alt alta', icon: Layers },
                         { id: 'interlinear', name: 'Satır Arası', desc: 'Orijinal altında çeviri', icon: TypeIcon },
                         { id: 'replace', name: 'Sadece Çeviri', desc: 'Orijinal metni çeviriyle değiştir', icon: Globe }
                       ].map(l => (
@@ -1825,6 +1355,7 @@ export default function App() {
                                     // Clear IndexedDB via idb-keyval
                                     const allKeys = await keys();
                                     await Promise.all(allKeys.map(k => del(k)));
+                                    await clearTranslationCache();
                                     // Clear localStorage
                                     localStorage.clear();
                                     alert('Tüm veriler temizlendi. Uygulama yeniden başlatılıyor.');
