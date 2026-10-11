@@ -1,5 +1,8 @@
 @import "tailwindcss";
 
+/* Dark mode follows the in-app toggle (.dark on <html>), not the OS setting. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --animate-fade-in: fadeIn 0.5s ease-out forwards;
   --animate-slide-up: slideUp 0.5s ease-out forwards;

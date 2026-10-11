@@ -86,6 +86,100 @@ const LANGUAGES = [
   { code: 'uk', name: 'Ukraynaca' },
 ];
 
+// --- EPUB Helpers ---
+const XHTML_NS = "http://www.w3.org/1999/xhtml";
+const BLOCK_SELECTOR = "p, h1, h2, h3, h4, h5, h6, li";
+
+interface GlossaryTerm {
+  source: string;
+  target: string;
+  type: 'word' | 'idiom';
+  contextEn: string;
+  contextTr: string;
+}
+
+const escapeRegExp = (string: string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const escapeXml = (s: string) => s
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;');
+
+const safeDecode = (s: string) => {
+  try { return decodeURIComponent(s); } catch { return s; }
+};
+
+// Resolves an OPF-relative href ("../Text/My%20Chapter.xhtml#x") to a zip path.
+const resolveZipPath = (zip: JSZip, baseDir: string, href: string): string => {
+  const normalize = (p: string) => {
+    const out: string[] = [];
+    for (const part of p.split('/')) {
+      if (part === '..') out.pop();
+      else if (part !== '.' && part !== '') out.push(part);
+    }
+    return out.join('/');
+  };
+  const withoutFragment = href.split('#')[0];
+  const decoded = normalize(baseDir + safeDecode(withoutFragment));
+  if (zip.file(decoded)) return decoded;
+  const raw = normalize(baseDir + withoutFragment);
+  return zip.file(raw) ? raw : decoded;
+};
+
+// Parses chapter content as XHTML, falling back to the HTML parser for files that are not well-formed XML.
+const parseChapterDoc = (content: string): Document => {
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(content, "application/xhtml+xml");
+  if (xmlDoc.body && xmlDoc.getElementsByTagName("parsererror").length === 0) return xmlDoc;
+  return parser.parseFromString(content, "text/html");
+};
+
+// Outermost translatable blocks only, so `li > p` is translated once and never inside the nav.
+const getTranslatableBlocks = (doc: Document): Element[] =>
+  Array.from(doc.querySelectorAll(BLOCK_SELECTOR))
+    .filter(el => !el.parentElement?.closest(BLOCK_SELECTOR) && !el.closest('nav'));
+
+// Wraps glossary terms found in the text nodes of `root` in highlight spans. Works on the DOM
+// (never on serialized HTML) so markup and attributes can't be matched. Returns the terms found.
+const highlightTerms = (root: Element, terms: GlossaryTerm[], field: 'source' | 'target'): Set<GlossaryTerm> => {
+  const found = new Set<GlossaryTerm>();
+  const usable = terms.filter(t => t[field] && t[field].length >= 3);
+  if (usable.length === 0) return found;
+
+  const doc = root.ownerDocument;
+  const alternatives = usable.map(t => `(${escapeRegExp(t[field])})`).join('|');
+  // Source terms match whole words; target terms may carry Turkish suffixes.
+  const tail = field === 'source' ? '(?![\\p{L}\\p{N}])' : '\\p{L}*';
+  const regex = new RegExp(`(?<![\\p{L}\\p{N}])(?:${alternatives})${tail}`, 'giu');
+
+  const textNodes: Text[] = [];
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  while (walker.nextNode()) textNodes.push(walker.currentNode as Text);
+
+  for (const node of textNodes) {
+    const text = node.data;
+    const frag = doc.createDocumentFragment();
+    let last = 0;
+    let match: RegExpExecArray | null;
+    regex.lastIndex = 0;
+    while ((match = regex.exec(text))) {
+      const term = usable[match.slice(1).findIndex(g => g !== undefined)];
+      found.add(term);
+      if (match.index > last) frag.appendChild(doc.createTextNode(text.slice(last, match.index)));
+      const span = doc.createElementNS(XHTML_NS, 'span');
+      span.setAttribute('style', term.type === 'idiom' ? 'color: #2563eb; font-weight: bold;' : 'font-weight: bold;');
+      span.textContent = match[0];
+      frag.appendChild(span);
+      last = match.index + match[0].length;
+    }
+    if (last === 0) continue;
+    if (last < text.length) frag.appendChild(doc.createTextNode(text.slice(last)));
+    node.parentNode?.replaceChild(frag, node);
+  }
+  return found;
+};
+
 // --- Translation Engine ---
 async function translateWithGemini(texts: TranslationPayload[], config: AppConfig): Promise<TranslationResult[]> {
   const ai = new GoogleGenAI({ apiKey: config.apiKey });
@@ -418,7 +512,7 @@ export default function App() {
   const [dictionaryLoading, setDictionaryLoading] = useState(false);
   const [dictionaryPos, setDictionaryPos] = useState({ x: 0, y: 0 });
 
-  const glossaryTermsRef = useRef<{source: string, target: string, type: 'word'|'idiom', contextEn: string, contextTr: string}[]>([]);
+  const glossaryTermsRef = useRef<GlossaryTerm[]>([]);
 
   useEffect(() => {
     if (isDarkMode) {
@@ -475,46 +569,6 @@ export default function App() {
     glossaryTermsRef.current = [];
   };
 
-  const escapeRegExp = (string: string) => {
-    return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  };
-
-  const highlightText = (text: string, word: string, isSource: boolean, type: 'word'|'idiom') => {
-    if (!word || word.length < 3) return text;
-    const style = type === 'idiom' ? 'color: #2563eb; font-weight: bold;' : 'font-weight: bold;';
-    try {
-      if (isSource) {
-        const regex = new RegExp(`\\b(${escapeRegExp(word)})\\b`, 'gi');
-        return text.replace(regex, `<span style="${style}">$1</span>`);
-      } else {
-        const regex = new RegExp(`(^|[^\\p{L}])(${escapeRegExp(word)}\\p{L}*)`, 'giu');
-        return text.replace(regex, `$1<span style="${style}">$2</span>`);
-      }
-    } catch (e) {
-      return text;
-    }
-  };
-
-  const setSafeHTML = (el: Element, html: string, doc: Document) => {
-    try {
-      el.innerHTML = html;
-    } catch (e) {
-      // XML documents are strict about innerHTML. Fallback to manual node import.
-      const parser = new DOMParser();
-      const tempDoc = parser.parseFromString(`<div>${html}</div>`, 'text/html');
-      const container = tempDoc.body.firstChild;
-      if (container) {
-        el.innerHTML = '';
-        Array.from(container.childNodes).forEach(node => {
-          const imported = doc.importNode(node, true);
-          el.appendChild(imported);
-        });
-      } else {
-        el.textContent = html;
-      }
-    }
-  };
-
   // --- Step 1: File Upload & Parsing ---
   const handleFile = async (uploadedFile: File) => {
     setFile(uploadedFile);
@@ -551,8 +605,11 @@ export default function App() {
         const manifestItem = manifestItems.find(item => item.getAttribute("id") === idref);
         if (manifestItem) {
           const href = manifestItem.getAttribute("href");
-          if (href && (href.endsWith('.html') || href.endsWith('.xhtml') || href.endsWith('.htm'))) {
-            const fullPath = basePath + href;
+          const mediaType = manifestItem.getAttribute("media-type") || '';
+          const isNavDoc = (manifestItem.getAttribute("properties") || '').split(/\s+/).includes('nav');
+          const isHtml = mediaType === 'application/xhtml+xml' || mediaType === 'text/html' || /\.x?html?$/i.test(href?.split('#')[0] || '');
+          if (href && isHtml && !isNavDoc) {
+            const fullPath = resolveZipPath(zip, basePath, href);
             
             // Try to extract title from HTML
             let title = `Chapter (${idref})`;
@@ -666,7 +723,6 @@ export default function App() {
     const selectedChapters = chapters.filter(c => c.selected);
     setProgress(p => ({ ...p, total: selectedChapters.length }));
     
-    const parser = new DOMParser();
     const serializer = new XMLSerializer();
     const translationMemory = new Map<string, string>();
 
@@ -680,8 +736,8 @@ export default function App() {
         try {
           const content = await zipInstance.file(chapter.fullPath)?.async("text");
           if (content) {
-            const htmlDoc = parser.parseFromString(content, "application/xhtml+xml");
-            const text = htmlDoc.body.textContent || '';
+            const htmlDoc = parseChapterDoc(content);
+            const text = htmlDoc.body?.textContent || '';
             
             // Extract words
             const words = text.match(/\b[a-zA-Z]{4,}\b/g);
@@ -762,8 +818,9 @@ export default function App() {
         const content = await zipInstance.file(chapter.fullPath)?.async("text");
         if (!content) throw new Error("File content not found");
         
-        const htmlDoc = parser.parseFromString(content, "application/xhtml+xml");
-        const elements = Array.from(htmlDoc.querySelectorAll("p, h1, h2, h3, h4, h5, h6, li"));
+        const htmlDoc = parseChapterDoc(content);
+        const elements = getTranslatableBlocks(htmlDoc);
+        const blockText = (el: Element) => (el.textContent || '').replace(/\s+/g, ' ').trim();
         
         if (elements.length > 0) {
           const BATCH_SIZE = 10; // Reduced from 15 to avoid 500 errors
@@ -774,7 +831,7 @@ export default function App() {
             const cached: any[] = [];
             
             batch.forEach((el, idx) => {
-              const text = el.textContent!.trim();
+              const text = blockText(el);
               if (text.length > 0) {
                 if (translationMemory.has(text)) {
                   cached.push({ id: idx, translation: translationMemory.get(text)! });
@@ -798,51 +855,64 @@ export default function App() {
               const transObj = translations.find(t => t.id === idx);
                 if (transObj && transObj.translation && transObj.translation !== payload.find(p => p.id === idx)?.text) {
                   
-                  let sourceText = el.textContent || '';
-                  let targetText = transObj.translation;
+                  const originalText = blockText(el);
+                  const isListItem = el.localName === 'li';
 
-                  if (config.buildGlossary && glossaryTermsRef.current.length > 0) {
-                    glossaryTermsRef.current.forEach(term => {
-                      const sourceHasTerm = new RegExp(`\\b${escapeRegExp(term.source)}\\b`, 'i').test(sourceText);
-                      if (sourceHasTerm) {
-                        sourceText = highlightText(sourceText, term.source, true, term.type);
-                        targetText = highlightText(targetText, term.target, false, term.type);
-                        
-                        if (config.contextualGlossary && !term.contextEn) {
-                          term.contextEn = el.textContent || '';
+                  // The translation is plain text; it goes in as a text node, never as markup.
+                  const translatedEl = isListItem
+                    ? htmlDoc.createElementNS(XHTML_NS, 'div')
+                    : el.cloneNode(false) as Element;
+                  translatedEl.removeAttribute('id'); // keep anchors (TOC, footnotes) unique
+                  translatedEl.textContent = transObj.translation;
+
+                  const useGlossary = config.buildGlossary && glossaryTermsRef.current.length > 0;
+                  const markGlossary = (sourceRoot: Element, targetRoot: Element) => {
+                    if (!useGlossary) return;
+                    const found = highlightTerms(sourceRoot, glossaryTermsRef.current, 'source');
+                    highlightTerms(targetRoot, Array.from(found), 'target');
+                    if (config.contextualGlossary) {
+                      found.forEach(term => {
+                        if (!term.contextEn) {
+                          term.contextEn = originalText;
                           term.contextTr = transObj.translation;
                         }
-                      }
-                    });
-                  }
+                      });
+                    }
+                  };
 
                   if (config.layout === 'side-by-side') {
-                    const table = htmlDoc.createElementNS("http://www.w3.org/1999/xhtml", "table");
+                    const table = htmlDoc.createElementNS(XHTML_NS, "table");
                     table.setAttribute("style", "width: 100%; border-collapse: collapse; margin-bottom: 1em; table-layout: fixed;");
-                    const tbody = htmlDoc.createElementNS("http://www.w3.org/1999/xhtml", "tbody");
-                    const tr = htmlDoc.createElementNS("http://www.w3.org/1999/xhtml", "tr");
+                    const tbody = htmlDoc.createElementNS(XHTML_NS, "tbody");
+                    const tr = htmlDoc.createElementNS(XHTML_NS, "tr");
                     
-                    const tdLeft = htmlDoc.createElementNS("http://www.w3.org/1999/xhtml", "td");
+                    const tdLeft = htmlDoc.createElementNS(XHTML_NS, "td");
                     tdLeft.setAttribute("style", "width: 50%; padding-right: 2%; vertical-align: top; border-right: 1px solid #ccc;");
                     
-                    const tdRight = htmlDoc.createElementNS("http://www.w3.org/1999/xhtml", "td");
+                    const tdRight = htmlDoc.createElementNS(XHTML_NS, "td");
                     tdRight.setAttribute("style", "width: 50%; padding-left: 2%; vertical-align: top;");
                     
-                    const translatedEl = el.cloneNode(false) as Element;
-                    setSafeHTML(translatedEl, targetText, htmlDoc);
-                    setSafeHTML(el, sourceText, htmlDoc);
+                    // The original keeps its inline markup (italics, links, footnote refs, images).
+                    // A <li> can't be wrapped in a table, so the table goes inside it instead.
+                    let originalEl: Element = el;
+                    if (isListItem) {
+                      originalEl = htmlDoc.createElementNS(XHTML_NS, 'div');
+                      while (el.firstChild) originalEl.appendChild(el.firstChild);
+                      el.appendChild(table);
+                    } else {
+                      el.parentNode?.insertBefore(table, el);
+                    }
+                    markGlossary(originalEl, translatedEl);
                     
                     // Logic to ensure English is always on the left and Turkish on the right
                     const shouldSwap = (config.targetLang === 'en' && config.sourceLang !== 'en') || 
                                      (config.sourceLang === 'tr' && config.targetLang !== 'tr');
 
-                    el.parentNode?.insertBefore(table, el);
-                    
                     if (shouldSwap) {
                       tdLeft.appendChild(translatedEl);
-                      tdRight.appendChild(el);
+                      tdRight.appendChild(originalEl);
                     } else {
-                      tdLeft.appendChild(el);
+                      tdLeft.appendChild(originalEl);
                       tdRight.appendChild(translatedEl);
                     }
 
@@ -852,14 +922,18 @@ export default function App() {
                     table.appendChild(tbody);
                   } 
                   else if (config.layout === 'interlinear') {
-                    const transEl = htmlDoc.createElementNS("http://www.w3.org/1999/xhtml", el.tagName.toLowerCase());
-                    transEl.setAttribute("style", `color: ${config.customColor}; background-color: ${config.customBg}; padding: 4px 8px; border-radius: 4px; margin-top: 4px; font-size: 0.95em; display: block;`);
-                    setSafeHTML(transEl, targetText, htmlDoc);
-                    setSafeHTML(el, sourceText, htmlDoc);
-                    el.parentNode?.insertBefore(transEl, el.nextSibling);
+                    translatedEl.setAttribute("style", `color: ${config.customColor}; background-color: ${config.customBg}; padding: 4px 8px; border-radius: 4px; margin-top: 4px; font-size: 0.95em; display: block;`);
+                    markGlossary(el, translatedEl);
+                    if (isListItem) el.appendChild(translatedEl);
+                    else el.parentNode?.insertBefore(translatedEl, el.nextSibling);
                   }
                   else if (config.layout === 'replace') {
-                    setSafeHTML(el, targetText, htmlDoc);
+                    // Collect glossary hits on a throwaway copy, then swap the text but keep images.
+                    markGlossary(el.cloneNode(true) as Element, translatedEl);
+                    const media = Array.from(el.querySelectorAll('img, svg')).filter(m => !m.parentElement?.closest('svg'));
+                    while (el.firstChild) el.removeChild(el.firstChild);
+                    media.forEach(m => el.appendChild(m));
+                    while (translatedEl.firstChild) el.appendChild(translatedEl.firstChild);
                   }
                 }
               });
@@ -931,12 +1005,12 @@ export default function App() {
       glossaryTermsRef.current.forEach(term => {
         const style = term.type === 'idiom' ? 'color: #2563eb;' : '';
         glossaryHtml += `<li style="margin-bottom: 12px;">
-          <strong style="${style}">${term.source}</strong>: ${term.target}`;
+          <strong style="${style}">${escapeXml(term.source)}</strong>: ${escapeXml(term.target)}`;
           
         if (config.contextualGlossary && term.contextEn) {
           glossaryHtml += `<br/>
-          <em style="color: #555; font-size: 0.9em;">"${term.contextEn}"</em><br/>
-          <em style="color: #777; font-size: 0.9em;">"${term.contextTr}"</em>`;
+          <em style="color: #555; font-size: 0.9em;">"${escapeXml(term.contextEn)}"</em><br/>
+          <em style="color: #777; font-size: 0.9em;">"${escapeXml(term.contextTr)}"</em>`;
         }
         
         glossaryHtml += `</li>`;
@@ -957,7 +1031,8 @@ export default function App() {
           const manifest = opfDoc.querySelector("manifest");
           const spine = opfDoc.querySelector("spine");
           
-          if (manifest && spine) {
+          const alreadyListed = Array.from(opfDoc.querySelectorAll("manifest > item")).some(i => i.getAttribute("id") === "auto-glossary");
+          if (manifest && spine && !alreadyListed) {
             const item = opfDoc.createElementNS(manifest.namespaceURI, "item");
             item.setAttribute("id", "auto-glossary");
             item.setAttribute("href", "glossary.html");
