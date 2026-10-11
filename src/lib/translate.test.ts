@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AppConfig } from '../types';
 import { translateBatch, simplifyBatch, chunkByChars } from './translate';
-import { parseJsonReply, mapParagraphs, LlmError, isFatal, stripThinking, isLlmConfigured, chat } from './llm';
+import { parseJsonReply, mapParagraphs, LlmError, isFatal, stripThinking, isLlmConfigured, chat, parseRateLimit } from './llm';
 
 const config = (overrides: Partial<AppConfig> = {}): AppConfig => ({
   sourceLang: 'en', targetLang: 'tr', layout: 'side-by-side', engine: 'gtx',
@@ -214,6 +214,31 @@ describe('llm helpers', () => {
 
     await chat(config({ llmModel: 'qwen' }), [{ role: 'user', content: 'x' }]); // other servers: untouched
     expect(llm[4].body.reasoning_effort).toBeUndefined();
+  });
+
+  it('explains quota errors and does not retry a spent daily quota', async () => {
+    const geminiBody = JSON.stringify([{ error: { code: 429, message: 'You exceeded your current quota, please check your plan and billing details.', status: 'RESOURCE_EXHAUSTED', details: [
+      { '@type': 'type.googleapis.com/google.rpc.QuotaFailure', violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier', quotaValue: '20', quotaDimensions: { model: 'gemini-3.8-flash' } }] },
+      { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '19222s' },
+    ] } }]);
+    const gemini = parseRateLimit(geminiBody, null, 'gemini-3.8-flash');
+    expect(gemini).toEqual({
+      daily: true,
+      retryMs: 19222000,
+      message: 'gemini-3.8-flash modelinin günlük ücretsiz kotası doldu (günde 20 istek). Yaklaşık 5 saat 21 dakika sonra yenilenir.',
+    });
+
+    const groq = parseRateLimit('{"error":{"message":"Rate limit reached for model `qwen/qwen3.8-27b` on tokens per day (TPD): Limit 500000, Used 499800. Please try again in 7m12.5s.","type":"tokens"}}', null, 'qwen/qwen3.8-27b');
+    expect(groq.daily).toBe(true);
+    expect(groq.retryMs).toBe(432500);
+    expect(groq.message).toContain('8 dakika sonra');
+
+    const perMinute = parseRateLimit('{"error":{"message":"Rate limit reached ... requests per minute (RPM). Please try again in 2s."}}', null, 'm');
+    expect(perMinute).toMatchObject({ daily: false, retryMs: 2000 });
+
+    const { llm } = installNetwork({ llmReply: () => new Response(geminiBody, { status: 429 }) });
+    await expect(chat(config({ llmModel: 'gemini-3.8-flash' }), [{ role: 'user', content: 'x' }])).rejects.toMatchObject({ status: 429, retryAfterMs: 19222000 });
+    expect(llm).toHaveLength(1); // no pointless retries
   });
 
   it('drops the thinking that reasoning models put in the reply', () => {

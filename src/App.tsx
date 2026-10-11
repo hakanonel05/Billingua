@@ -91,7 +91,7 @@ export default function App() {
   const reportLlmError = (err: Error) => {
     if (llmErrorShownRef.current) return;
     llmErrorShownRef.current = true;
-    setErrorMsg(`Yapay zeka kullanılamadı, çeviri Google Translate ile sürüyor. (${err.message})`);
+    setErrorMsg(`${err.message} Kalan paragraflar Google Translate ile çevriliyor; Ayarlar'dan başka bir model ya da servis seçebilirsiniz.`);
   };
 
   const handleFetchModels = async () => {

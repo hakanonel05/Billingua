@@ -1,7 +1,7 @@
 import type { MutableRefObject } from 'react';
 import type { AppConfig, SimplifyLevel, TranslationPayload, TranslationResult } from '../types';
 import { getCachedTranslations, setCachedTranslations } from './db';
-import { isFatal, isLlmConfigured, mapParagraphs } from './llm';
+import { isFatal, isLlmConfigured, mapParagraphs, type LlmError } from './llm';
 
 export interface TranslateContext {
   // Source paragraphs right before this batch, so the model knows who "he" is (AI engine only).
@@ -293,7 +293,8 @@ export async function translateBatch(
     } catch (err) {
       console.error("AI engine error", err);
       if (isFatal(err)) {
-        llmBlockedUntil = Date.now() + LLM_PAUSE_MS;
+        // A daily quota stays exhausted for hours: skip the model for as long as the service said.
+        llmBlockedUntil = Date.now() + Math.max(LLM_PAUSE_MS, (err as LlmError).retryAfterMs ?? 0);
         context.onLlmError?.(err as Error);
       }
     }

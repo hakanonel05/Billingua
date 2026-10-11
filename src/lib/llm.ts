@@ -32,9 +32,9 @@ export const LLM_PRESETS: LlmPreset[] = [
     id: 'google',
     name: 'Google AI Studio — Gemini (Google API anahtarıyla)',
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
-    model: 'gemini-3.8-flash',
+    model: 'gemini-3.5-flash-lite',
     needsKey: true,
-    hint: 'aistudio.google.com/apikey adresinden anahtar alın. Gemini Flash hızlıdır ama açık kaynak değildir; buradaki açık Gemma modelleri ise çok yavaştır. Limitleri aistudio.google.com/rate-limit sayfasında görebilirsiniz.',
+    hint: 'aistudio.google.com/apikey adresinden anahtar alın. Ücretsiz katmanda gemini-3.8-flash günde yalnızca 20 istek verir (bir kitap için yetmez); varsayılan gemini-3.5-flash-lite daha bol kotalıdır. Gemini açık kaynak değildir; buradaki açık Gemma modelleri ise çok yavaştır. Kalan kotanızı aistudio.google.com/rate-limit sayfasında görebilirsiniz.',
   },
   {
     id: 'ollama',
@@ -85,7 +85,8 @@ const headers = (s: LlmSettings): Record<string, string> => {
 };
 
 export class LlmError extends Error {
-  constructor(message: string, readonly status?: number) {
+  // retryAfterMs: how long the service said to wait (rate limits), when it said so.
+  constructor(message: string, readonly status?: number, readonly retryAfterMs?: number) {
     super(message);
   }
 }
@@ -129,15 +130,63 @@ const MAX_BUSY_RETRIES = 4;
 const MAX_RETRY_WAIT_MS = 65_000;
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// Honors Retry-After (seconds or HTTP date) when the server sends it, else backs off 2s, 4s, 8s...
-export const retryDelayMs = (res: Response, attempt: number): number => {
+// Retry-After in milliseconds (seconds or HTTP date), or null when absent.
+const headerRetryMs = (res: Response): number | null => {
   const header = res.headers.get('retry-after');
-  let ms = NaN;
-  if (header) {
-    ms = /^\d+(\.\d+)?$/.test(header.trim()) ? parseFloat(header) * 1000 : Date.parse(header) - Date.now();
+  if (!header) return null;
+  const ms = /^\d+(\.\d+)?$/.test(header.trim()) ? parseFloat(header) * 1000 : Date.parse(header) - Date.now();
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
+};
+
+// Honors Retry-After when the server sends it, else backs off 2s, 4s, 8s...
+export const retryDelayMs = (res: Response, attempt: number): number =>
+  Math.min((headerRetryMs(res) ?? 2000 * 2 ** attempt) + 250, MAX_RETRY_WAIT_MS);
+
+const formatDuration = (ms: number) => {
+  const minutes = Math.ceil(ms / 60_000);
+  if (minutes < 1) return `${Math.ceil(ms / 1000)} saniye`;
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return h ? `${h} saat${m ? ` ${m} dakika` : ''}` : `${m} dakika`;
+};
+
+export interface RateLimit {
+  retryMs: number | null;
+  daily: boolean;
+  message: string;
+}
+
+// Reads what a 429 says: how long to wait and whether a daily quota ran out, as a message a reader
+// understands. Gemini puts it in error.details (quotaId "...PerDay...", quotaValue, retryDelay "19222s");
+// Groq in error.message ("... tokens per day (TPD): Limit 100000 ... Please try again in 7m12.5s").
+export const parseRateLimit = (bodyText: string, headerMs: number | null, model: string): RateLimit => {
+  let json: any;
+  try { json = JSON.parse(bodyText); } catch { /* not JSON */ }
+  const error = (Array.isArray(json) ? json[0] : json)?.error ?? {};
+  const text = typeof error.message === 'string' ? error.message : bodyText;
+
+  let retryMs = headerMs;
+  let daily = /per ?day|\(TPD\)|\(RPD\)/i.test(text);
+  let limit: string | undefined;
+  for (const detail of Array.isArray(error.details) ? error.details : []) {
+    const seconds = parseFloat(detail?.retryDelay);
+    if (Number.isFinite(seconds)) retryMs = seconds * 1000;
+    for (const v of detail?.violations || []) {
+      if (/PerDay/i.test(v?.quotaId || '')) daily = true;
+      if (v?.quotaValue) limit = String(v.quotaValue);
+    }
   }
-  if (!Number.isFinite(ms) || ms < 0) ms = 2000 * 2 ** attempt;
-  return Math.min(ms + 250, MAX_RETRY_WAIT_MS);
+  const wait = text.match(/try again in ((?:\d+h)?(?:\d+m)?(?:[\d.]+s)?)/i);
+  if (retryMs == null && wait?.[1]) {
+    const part = (unit: string) => parseFloat(wait[1].match(new RegExp(`([\\d.]+)${unit}`))?.[1] || '0');
+    retryMs = (part('h') * 3600 + part('m') * 60 + part('s')) * 1000;
+  }
+
+  const when = retryMs ? formatDuration(retryMs) : null;
+  const message = daily
+    ? `${model} modelinin günlük ücretsiz kotası doldu${limit ? ` (günde ${limit} istek)` : ''}.${when ? ` Yaklaşık ${when} sonra yenilenir.` : ''}`
+    : `${model} modelinin istek sınırı aşıldı.${when ? ` ${when} sonra yeniden denenebilir.` : ''}`;
+  return { retryMs, daily, message };
 };
 
 export async function chat(
@@ -164,10 +213,21 @@ export async function chat(
       delete body.reasoning_effort;
       continue;
     }
-    // 429: rate limit. 5xx: transient server errors (Google's endpoint returns occasional 500s).
-    const busy = res.status === 429 || res.status >= 500;
-    if (!busy || attempt >= MAX_BUSY_RETRIES) break;
-    await sleep(retryDelayMs(res, attempt));
+    if (res.status === 429) {
+      const limit = parseRateLimit(await res.clone().text().catch(() => ''), headerRetryMs(res), s.llmModel.trim());
+      // A daily quota, or a wait longer than a minute, won't clear by retrying now.
+      if (limit.daily || (limit.retryMs ?? 0) > MAX_RETRY_WAIT_MS || attempt >= MAX_BUSY_RETRIES) {
+        throw new LlmError(limit.message, 429, limit.retryMs ?? undefined);
+      }
+      await sleep(Math.min((limit.retryMs ?? 2000 * 2 ** attempt) + 250, MAX_RETRY_WAIT_MS));
+      continue;
+    }
+    // Transient server errors (Google's endpoint returns occasional 500s).
+    if (res.status >= 500 && attempt < MAX_BUSY_RETRIES) {
+      await sleep(retryDelayMs(res, attempt));
+      continue;
+    }
+    break;
   }
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
