@@ -554,8 +554,10 @@ export default function App() {
         const translated: (string | undefined)[] = [];
 
         // Google: a few batches at once. AI model: one batch at a time, so each batch sees how the
-        // previous one was translated. Results are applied in document order either way.
-        const waveSpan = BATCH_SIZE * (config.engine === 'llm' ? 1 : PARALLEL_BATCHES);
+        // previous one was translated (without a usable model it's Google again, so in parallel).
+        // Results are applied in document order either way.
+        const sequential = config.engine === 'llm' && isLlmConfigured(config);
+        const waveSpan = BATCH_SIZE * (sequential ? 1 : PARALLEL_BATCHES);
         for (let start = 0; start < elements.length; start += waveSpan) {
           if (pauseRef.current) break;
           const wave: number[] = [];
@@ -816,7 +818,7 @@ export default function App() {
             <div className="bg-gradient-to-br from-blue-500 to-cyan-500 p-2 rounded-xl shadow-md">
               <BookOpen className="w-5 h-5 text-white" />
             </div>
-            <h1 className={`text-xl font-bold tracking-tight ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>Epub Master</h1>
+            <h1 className={`text-xl font-bold tracking-tight ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>Billingua</h1>
           </div>
           
           <nav className="hidden md:flex items-center gap-8 font-medium text-sm">
@@ -896,7 +898,7 @@ export default function App() {
 
             {/* How it Works Section */}
             <div id="how-it-works" className="max-w-5xl mx-auto px-6 py-20">
-              <h2 className={`text-3xl font-bold text-center mb-16 ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>Epub Master Nasıl Kullanılır?</h2>
+              <h2 className={`text-3xl font-bold text-center mb-16 ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>Billingua Nasıl Kullanılır?</h2>
               <div className="grid md:grid-cols-3 gap-8">
                 {[
                   {

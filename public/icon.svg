@@ -1,5 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <rect width="512" height="512" rx="64" fill="#3b82f6"/>
-  <text x="50%" y="55%" font-family="sans-serif" font-size="250" fill="white" text-anchor="middle" dominant-baseline="middle">B</text>
-  <text x="70%" y="75%" font-family="sans-serif" font-size="120" fill="#dbeafe" text-anchor="middle" dominant-baseline="middle">L</text>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2563eb"/>
+      <stop offset="1" stop-color="#4338ca"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <!-- book cover behind the pages -->
+  <path d="M256 196 C200 168 124 164 72 180 L72 404 C124 390 200 394 256 422 C312 394 388 390 440 404 L440 180 C388 164 312 168 256 196 Z" fill="#1e1b4b" opacity="0.35"/>
+  <!-- left page: English -->
+  <path d="M252 178 C206 148 140 142 92 156 L92 380 C140 366 206 372 252 402 Z" fill="#ffffff"/>
+  <!-- right page: Turkish -->
+  <path d="M260 178 C306 148 372 142 420 156 L420 380 C372 366 306 372 260 402 Z" fill="#eef2ff"/>
+  <text x="172" y="318" font-family="Segoe UI, Arial, sans-serif" font-size="132" font-weight="700" fill="#2563eb" text-anchor="middle">A</text>
+  <text x="340" y="318" font-family="Segoe UI, Arial, sans-serif" font-size="132" font-weight="700" fill="#e11d48" text-anchor="middle">Ç</text>
 </svg>

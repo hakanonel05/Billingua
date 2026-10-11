@@ -11,10 +11,10 @@ export default defineConfig(() => {
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
-        includeAssets: ['icon.svg'],
+        includeAssets: ['icon.svg', 'icon.png'],
         manifest: {
-          name: 'Epub Master - İki Dilli Kitap Oluşturucu',
-          short_name: 'Epub Master',
+          name: 'Billingua - İki Dilli Kitap Oluşturucu',
+          short_name: 'Billingua',
           description: 'AI kullanarak kitaplar için yan yana İngilizce-Türkçe iki dilli metinler oluşturur.',
           theme_color: '#3b82f6',
           icons: [
@@ -27,6 +27,11 @@ export default defineConfig(() => {
               src: 'icon.svg',
               sizes: '512x512',
               type: 'image/svg+xml'
+            },
+            {
+              src: 'icon.png',
+              sizes: '512x512',
+              type: 'image/png'
             }
           ]
         }

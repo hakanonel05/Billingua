@@ -21,6 +21,30 @@
 - **Otomatik sözlük.** Seçilen seviyenin üstündeki kelimeler ve deyimler, geçtikleri cümleyle birlikte kitabın sonuna eklenir. Sözlük içindekiler listesinde de yer alır.
 - **Doğru metaveri.** Çıktı EPUB'da hedef dil `dc:language` alanına eklenir, başlığa da `(EN–TR)` etiketi gelir. Çeviri paragrafları `lang`/`xml:lang` ile işaretlenir; böylece okuyucular doğru sesle okur ve doğru heceler.
 
+## Masaüstü uygulaması (Windows ve Mac)
+
+Hazır dosyalar repodaki **Releases** sayfasında:
+
+- **Windows:** `Billingua-x.y.z-kurulum.exe` (kurulum) ya da `Billingua-x.y.z-portable.exe` (kurulumsuz, tek dosya)
+- **Mac:** `Billingua-x.y.z-mac.dmg` (Intel ve Apple Silicon)
+
+Masaüstü uygulaması web sürümüyle aynıdır; Google Translate isteklerini kendisi yapar, ayrı bir sunucu gerekmez. Kütüphane, ayarlar ve çeviri önbelleği bilgisayarda kalır.
+
+Uygulamalar ücretli bir geliştirici sertifikasıyla imzalanmadığı için ilk açılışta uyarı çıkar:
+
+- **Windows:** "Windows bilgisayarınızı korudu" → **Ek bilgi** → **Yine de çalıştır**
+- **Mac:** Uygulamaya sağ tıklayın → **Aç** → **Aç**. "Hasarlı" uyarısı çıkarsa Terminal'de `xattr -cr /Applications/Billingua.app` çalıştırın.
+
+Kendiniz derlemek için:
+
+```bash
+npm run dist:exe   # Windows: release/ klasörüne .exe dosyaları
+npm run dist:mac   # Mac (yalnızca macOS'ta): release/ klasörüne .dmg
+npm run electron   # derleyip masaüstü uygulamasını açar
+```
+
+Yeni bir sürüm etiketi (`git tag v1.0.1 && git push origin v1.0.1`) gönderildiğinde GitHub Actions iki platformu da derleyip Releases sayfasına koyar (`.github/workflows/desktop.yml`).
+
 ## Çalıştırma
 
 Node.js gerekir.

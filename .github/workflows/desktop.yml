@@ -1,0 +1,76 @@
+# Builds the desktop apps: Windows (.exe) and macOS (.dmg).
+# A pushed version tag (v1.0.0) also publishes them on the repository's Releases page;
+# "Run workflow" on the Actions tab builds them as downloadable artifacts only.
+name: Desktop builds
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: --win
+            files: |
+              release/*.exe
+          - os: macos-latest
+            target: --mac
+            files: |
+              release/*.dmg
+    runs-on: ${{ matrix.os }}
+    env:
+      # No paid signing certificates: Windows builds are unsigned, macOS builds are ad-hoc signed.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # npm install rather than npm ci: the lockfile is written on Windows and may miss the
+      # platform-specific optional packages macOS needs (rollup, lightningcss, esbuild).
+      - run: npm install --no-audit --no-fund
+
+      - run: npm run lint
+      - run: npm test
+
+      - run: npm run build:electron
+      - run: npx electron-builder ${{ matrix.target }} --publish never
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: billingua-${{ matrix.os }}
+          path: ${{ matrix.files }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          body: |
+            ## İndirme
+
+            - **Windows:** `Billingua-*-kurulum.exe` (kurulum) ya da `Billingua-*-portable.exe` (kurulumsuz, tek dosya)
+            - **Mac (Intel ve Apple Silicon):** `Billingua-*-mac.dmg`
+
+            Uygulamalar ücretli bir geliştirici sertifikasıyla imzalanmadığı için ilk açılışta uyarı çıkar:
+            - **Windows:** "Windows bilgisayarınızı korudu" → **Ek bilgi** → **Yine de çalıştır**
+            - **Mac:** Uygulamaya sağ tıklayın → **Aç** → **Aç**. "Hasarlı" uyarısı çıkarsa Terminal'de: `xattr -cr /Applications/Billingua.app`
