@@ -135,6 +135,8 @@ export function levelOf(word: string, table: RankTable): CEFRLevel {
 export const levelIndex = (level: string) => CEFR_LEVELS.indexOf(level as CEFRLevel);
 
 const WORD_RE = /[A-Za-z]+(?:'[A-Za-z]+)?/g;
+// Typographic apostrophes (don’t) are matched like straight ones (don't).
+const normalizeApostrophes = (text: string) => text.replace(/[\u2019\u02BC]/g, "'");
 
 // Sentence-initial function words ("The", "However") are capitalized too, so the most common
 // words never count as names even when the text has no lowercase occurrence.
@@ -144,9 +146,10 @@ const NEVER_A_NAME_RANK = 300;
 export function findProperNouns(text: string, table?: RankTable): Map<string, number> {
   const capitalized = new Map<string, number>();
   const lowercase = new Set<string>();
-  for (const m of text.matchAll(WORD_RE)) {
+  for (const m of normalizeApostrophes(text).matchAll(WORD_RE)) {
     const w = m[0];
-    if (/^[A-Z][a-z]/.test(w)) capitalized.set(w, (capitalized.get(w) || 0) + 1);
+    // "Doctor" and all-caps names like "TARDIS"
+    if (/^[A-Z]/.test(w)) capitalized.set(w, (capitalized.get(w) || 0) + 1);
     else if (/^[a-z]/.test(w)) lowercase.add(w);
   }
   const names = new Map<string, number>();
@@ -177,9 +180,10 @@ export function analyzeCEFR(text: string, table: RankTable): CEFRLevelStats {
 
   const names = findProperNouns(text, table);
   const counts = new Map<string, number>();
-  for (const m of text.matchAll(WORD_RE)) {
-    if (names.has(m[0])) continue;
-    const word = m[0].toLowerCase().replace(/'s$/, '');
+  for (const m of normalizeApostrophes(text).matchAll(WORD_RE)) {
+    // Contractions and possessives ("didn't", "I'm", "Doctor's") are not rated at all.
+    if (names.has(m[0]) || m[0].includes("'")) continue;
+    const word = m[0].toLowerCase();
     counts.set(word, (counts.get(word) || 0) + 1);
   }
 

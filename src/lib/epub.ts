@@ -154,11 +154,12 @@ export const relativeHref = (fromDir: string, toPath: string): string => {
   return [...from.slice(common).map(() => '..'), ...to.slice(common)].map(encodeURIComponent).join('/');
 };
 
-// Marks the book as bilingual: adds the target language and a language tag to the title.
-// For "replace" the book becomes a translation, so the target language goes first.
+// Marks the book as bilingual: adds the target language and a language tag to the title
+// (plus the CEFR level when the English was simplified). For "replace" the book becomes a
+// translation, so the target language goes first.
 export const updatePackageMetadata = (
   opfDoc: Document,
-  { sourceLang, targetLang, layout }: { sourceLang: string; targetLang: string; layout: string },
+  { sourceLang, targetLang, layout, simplifyLevel = 'off' }: { sourceLang: string; targetLang: string; layout: string; simplifyLevel?: string },
 ) => {
   const metadata = opfDoc.getElementsByTagNameNS('*', 'metadata')[0];
   if (!metadata) return;
@@ -185,9 +186,10 @@ export const updatePackageMetadata = (
 
   const title = metadata.getElementsByTagNameNS(DC_NS, 'title')[0];
   if (title && source) {
+    const level = simplifyLevel !== 'off' ? `, ${simplifyLevel}` : '';
     const tag = layout === 'replace'
-      ? `(${targetLang.toUpperCase()})`
-      : `(${baseLang(source).toUpperCase()}–${targetLang.toUpperCase()})`;
+      ? `(${targetLang.toUpperCase()}${level})`
+      : `(${baseLang(source).toUpperCase()}–${targetLang.toUpperCase()}${level})`;
     const current = title.textContent?.trim() || '';
     if (!current.endsWith(tag)) title.textContent = `${current} ${tag}`.trim();
   }

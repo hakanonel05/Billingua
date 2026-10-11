@@ -1,34 +1,43 @@
 import type { MutableRefObject } from 'react';
-import { GoogleGenAI, Type } from '@google/genai';
-import type { AppConfig, TranslationPayload, TranslationResult } from '../types';
+import type { AppConfig, SimplifyLevel, TranslationPayload, TranslationResult } from '../types';
 import { getCachedTranslations, setCachedTranslations } from './db';
+import { isFatal, isLlmConfigured, mapParagraphs } from './llm';
 
 export interface TranslateContext {
-  // Source paragraphs right before this batch, so the model knows who "he" is (Gemini only).
+  // Source paragraphs right before this batch, so the model knows who "he" is (AI engine only).
   precedingText?: string[];
-  // Recurring character/place names that must stay unchanged (Gemini only).
+  // Recurring character/place names that must stay unchanged (AI engine only).
   names?: string[];
+  // Told when the AI engine fails for good (server down, bad key, quota), so the UI can say so.
+  onLlmError?: (err: Error) => void;
 }
 
 const MAX_CHARS = 2000;
 const DELIMITER = '\n\n|||\n\n';
 const DELIMITER_RE = /(?:\s*\|\|\|\s*)+/;
-const GEMINI_QUOTA_PAUSE_MS = 60_000;
+const LLM_PAUSE_MS = 60_000;
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-const isQuotaError = (err: unknown) => /429|quota|RESOURCE_EXHAUSTED/i.test((err as any)?.message || String(err));
-
-// After a quota error Gemini is skipped for a while instead of failing once per batch.
-let geminiBlockedUntil = 0;
-const geminiAvailable = (config: AppConfig) => !!config.apiKey && Date.now() >= geminiBlockedUntil;
+// After a fatal error (server down, quota) the model is skipped for a while instead of failing once per batch.
+let llmBlockedUntil = 0;
+const llmAvailable = (config: AppConfig) => isLlmConfigured(config) && Date.now() >= llmBlockedUntil;
 
 // Set once the /api proxy answers 404 (static hosting), so later requests go straight to Google.
 let proxyMissing = false;
 
+const languageName = (code: string) => {
+  if (code === 'auto') return 'the detected language';
+  try {
+    return new Intl.DisplayNames(['en'], { type: 'language' }).of(code) || code;
+  } catch {
+    return code;
+  }
+};
+
 // --- Cache keys ---
-// Each engine writes under its own namespace, so a Google fallback result never masquerades as a
-// Gemini translation on the next run, and Gemini results depend on the settings that shape them.
+// Each engine writes under its own namespace, so a Google fallback result never masquerades as an
+// AI translation on the next run, and AI results depend on the settings that shape them.
 
 const hash = (s: string) => {
   let h = 5381;
@@ -37,8 +46,8 @@ const hash = (s: string) => {
 };
 
 const GTX_NS = 'gtx';
-const geminiNamespace = (config: AppConfig) =>
-  `gemini:${config.geminiModel}:${config.tone}:${hash(config.customGlossary || '')}`;
+const llmNamespace = (config: AppConfig) =>
+  `llm:${hash(config.llmBaseUrl.trim())}:${config.llmModel.trim()}:${config.tone}:${hash(config.customGlossary || '')}`;
 const cacheKey = (ns: string, config: AppConfig, text: string) =>
   `${ns}|${config.sourceLang}>${config.targetLang}|${text}`;
 
@@ -60,61 +69,66 @@ export const chunkByChars = (items: TranslationPayload[], maxChars = MAX_CHARS):
   return chunks;
 };
 
-// --- Gemini ---
+// --- Open-source model (OpenAI-compatible server) ---
 
-export async function translateWithGemini(
+export async function translateWithLlm(
   texts: TranslationPayload[],
   config: AppConfig,
   context: TranslateContext = {},
 ): Promise<TranslationResult[]> {
-  const ai = new GoogleGenAI({ apiKey: config.apiKey });
-  const source = config.sourceLang === 'auto' ? 'the detected language' : `the language with code "${config.sourceLang}"`;
+  let instruction = `You are a professional book translator. Translate the text from ${languageName(config.sourceLang)} into ${languageName(config.targetLang)}. Translate faithfully and completely; never summarize, merge paragraphs or add notes. Maintain literary tone for fiction, and clear tone for non-fiction.`;
+  if (config.tone !== 'default') instruction += ` Use a ${config.tone} tone.`;
+  if (context.names?.length) instruction += ` Keep these names exactly as written: ${context.names.join(', ')}.`;
+  if (config.customGlossary) instruction += `\nFollow these glossary rules:\n${config.customGlossary}`;
 
-  const prompt = [
-    `Translate each "text" from ${source} into the language with code "${config.targetLang}". Return exactly one item per input, with the same "id".`,
-  ];
-  if (context.precedingText?.length) {
-    prompt.push(`The passage just before these texts, for context only (do not translate it):\n"""\n${context.precedingText.join('\n\n')}\n"""`);
-  }
-  prompt.push(JSON.stringify(texts));
+  const translated = await mapParagraphs(config, instruction, texts, context.precedingText);
+  return Array.from(translated, ([id, translation]) => ({ id, translation }));
+}
 
-  let systemInstruction = 'You are a professional book translator. Translate the given JSON array of texts faithfully and completely; never summarize, merge items or add notes. Maintain literary tone for fiction, and clear tone for non-fiction. Never change the IDs.';
-  if (config.tone !== 'default') systemInstruction += ` Use a ${config.tone} tone for the translation.`;
-  if (context.names?.length) systemInstruction += `\n\nKeep these names exactly as written: ${context.names.join(', ')}.`;
-  if (config.customGlossary) systemInstruction += `\n\nUse the following custom glossary rules:\n${config.customGlossary}`;
+// --- Simplification (graded-reader rewrite) ---
 
-  const response = await ai.models.generateContent({
-    model: config.geminiModel || 'gemini-3-flash-preview',
-    contents: prompt.join('\n\n'),
-    config: {
-      systemInstruction,
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            id: { type: Type.NUMBER },
-            translation: { type: Type.STRING }
-          },
-          required: ["id", "translation"]
-        }
-      }
-    }
+const SIMPLIFY_GUIDE: Record<Exclude<SimplifyLevel, 'off'>, string> = {
+  A2: 'Use only very common everyday words and short simple sentences (present and past simple, "and", "but", "because").',
+  B1: 'Use common vocabulary and mostly simple or compound sentences; replace rare and literary words with everyday ones.',
+  B2: 'Keep a natural style but replace rare, archaic or literary words and untangle very long sentences.',
+};
+
+const simplifyNamespace = (config: AppConfig, level: SimplifyLevel) =>
+  `simplify:${level}:${hash(config.llmBaseUrl.trim())}:${config.llmModel.trim()}`;
+
+// Rewrites English paragraphs at a lower CEFR level with the AI engine. Returns rewrites only for
+// paragraphs that were rewritten; the rest stay as they are. Fatal model errors are thrown.
+export async function simplifyBatch(
+  texts: TranslationPayload[],
+  config: AppConfig,
+  level: SimplifyLevel,
+  context: TranslateContext = {},
+): Promise<Map<number, string>> {
+  const results = new Map<number, string>();
+  if (level === 'off' || texts.length === 0) return results;
+  if (!isLlmConfigured(config)) throw new Error('Metni sadeleştirmek için bir yapay zeka sunucusu ve model seçin.');
+
+  const ns = simplifyNamespace(config, level);
+  const key = (text: string) => `${ns}|${text}`;
+  const hits = await getCachedTranslations(texts.map(t => key(t.text)));
+  const pending = texts.filter((t, i) => {
+    if (hits[i]) results.set(t.id, hits[i]!);
+    return !hits[i];
   });
+  if (pending.length === 0) return results;
 
-  if (!response.text) throw new Error("Empty response from Gemini");
-  let text = response.text.trim();
-  if (text.startsWith('```json')) text = text.replace(/^```json\n/, '').replace(/\n```$/, '');
-  if (text.startsWith('```')) text = text.replace(/^```\n/, '').replace(/\n```$/, '');
-  const parsed = JSON.parse(text);
-  if (!Array.isArray(parsed)) throw new Error("Gemini response is not an array");
+  let instruction = `You rewrite fiction and non-fiction for English learners at CEFR level ${level}. Rewrite the text in simpler English. ${SIMPLIFY_GUIDE[level]} Keep every event, fact, line of dialogue and name, in the same order; do not summarize, shorten the story or add anything. Keep quotation marks around dialogue.`;
+  if (context.names?.length) instruction += ` Keep these names exactly as written: ${context.names.join(', ')}.`;
 
-  // Drop anything that doesn't answer one of our ids; missing ids fall through to Google Translate.
-  const wanted = new Set(texts.map(t => t.id));
-  return parsed.filter((r: any) =>
-    r && wanted.has(r.id) && typeof r.translation === 'string' && r.translation.trim() !== ''
-  );
+  const rewritten = await mapParagraphs(config, instruction, pending, context.precedingText);
+  const fresh: [string, string][] = [];
+  rewritten.forEach((text, id) => {
+    const source = pending.find(t => t.id === id)!.text;
+    results.set(id, text);
+    fresh.push([key(source), text]);
+  });
+  await setCachedTranslations(fresh);
+  return results;
 }
 
 // --- Google Translate ---
@@ -221,7 +235,7 @@ export async function translateBatch(
 ): Promise<TranslationResult[]> {
   const results = new Map<number, string>();
   const fresh: [string, string][] = [];
-  const geminiNs = geminiNamespace(config);
+  const llmNs = llmNamespace(config);
   const textById = new Map(texts.map(t => [t.id, t.text]));
 
   const record = (ns: string, translated: TranslationResult[]) => {
@@ -235,19 +249,22 @@ export async function translateBatch(
     }
   };
 
-  const runGemini = async (items: TranslationPayload[]) => {
-    if (items.length === 0 || !geminiAvailable(config)) return;
+  const runLlm = async (items: TranslationPayload[]) => {
+    if (items.length === 0 || !llmAvailable(config)) return;
     try {
-      record(geminiNs, await translateWithGemini(items, config, context));
+      record(llmNs, await translateWithLlm(items, config, context));
     } catch (err) {
-      console.error("Gemini API error", err);
-      if (isQuotaError(err)) geminiBlockedUntil = Date.now() + GEMINI_QUOTA_PAUSE_MS;
+      console.error("AI engine error", err);
+      if (isFatal(err)) {
+        llmBlockedUntil = Date.now() + LLM_PAUSE_MS;
+        context.onLlmError?.(err as Error);
+      }
     }
   };
 
   // 1. Translations from earlier runs.
-  const namespaces = config.engine === 'gemini' ? [geminiNs]
-    : config.engine === 'gtx-fallback' ? [GTX_NS, geminiNs]
+  const namespaces = config.engine === 'llm' ? [llmNs]
+    : config.engine === 'gtx-fallback' ? [GTX_NS, llmNs]
     : [GTX_NS];
   let pending = texts;
   for (const ns of namespaces) {
@@ -262,15 +279,15 @@ export async function translateBatch(
     });
   }
 
-  // 2. Gemini as the primary engine.
-  if (config.engine === 'gemini') {
-    await runGemini(pending);
+  // 2. The AI model as the primary engine.
+  if (config.engine === 'llm') {
+    await runLlm(pending);
     pending = pending.filter(t => !results.has(t.id));
   }
 
-  // 3. Google Translate for the rest: primary engine, or the safety net for Gemini.
+  // 3. Google Translate for the rest: primary engine, or the safety net for the model.
   const onGtxFailed = async (items: TranslationPayload[]) => {
-    if (config.engine === 'gtx-fallback') await runGemini(items);
+    if (config.engine === 'gtx-fallback') await runLlm(items);
   };
   for (const chunk of chunkByChars(pending)) {
     if (pauseRef.current) break;

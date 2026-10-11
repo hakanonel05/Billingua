@@ -5,15 +5,25 @@ import { BookOpen, UploadCloud, Download, Loader2, CheckCircle, Layout, FileText
 import { saveBookToLibrary, getLibraryBooks, deleteBookFromLibrary, SavedBook, loadSettings, saveSettings, savePendingJob, loadPendingJob, clearPendingJob, clearTranslationCache, PendingJob } from './lib/db';
 import { analyzeCEFR, getComprehensionPercentage, wordsToLearn, loadRankTable, frequentNames, levelOf, levelIndex, CEFRLevelStats } from './lib/cefr';
 import { XHTML_NS, resolveZipPath, parseChapterDoc, getTranslatableBlocks, highlightTerms, createSampleEpub, createPair, markLanguage, PAIR_CSS, buildGlossaryXhtml, updatePackageMetadata, addSpineItem, addToTableOfContents } from './lib/epub';
-import { translateBatch } from './lib/translate';
+import { translateBatch, simplifyBatch } from './lib/translate';
+import { epubToPdf, pdfSupportsLanguage } from './lib/pdf';
 import { IDIOMS, LANGUAGES } from './constants';
-import type { LayoutType, EngineType, Chapter, AppConfig, GlossaryTerm } from './types';
+import type { LayoutType, EngineType, Chapter, AppConfig, GlossaryTerm, SimplifyLevel } from './types';
+import { LLM_PRESETS, listModels, isLlmConfigured, isFatal } from './lib/llm';
 
 const storedSettings = loadSettings();
 
+// Saved settings minus anything an older version stored that no longer exists (the Gemini engine).
+const storedConfig = (): Partial<AppConfig> => {
+  const { geminiModel, apiKey, ...rest } = (storedSettings.config || {}) as Partial<AppConfig> & { geminiModel?: string; apiKey?: string };
+  if ((rest.engine as string) === 'gemini') rest.engine = 'llm';
+  return rest;
+};
+
 const BATCH_SIZE = 10;        // paragraphs per translation request
 const PARALLEL_BATCHES = 3;   // requests in flight at once
-const CONTEXT_PARAGRAPHS = 3; // preceding paragraphs sent to Gemini as context
+const CONTEXT_PARAGRAPHS = 3; // preceding paragraphs sent to the AI model as context
+const SIMPLIFY_MIN_WORDS = 6; // shorter lines are left as they are when simplifying
 
 // --- Main App Component ---
 export default function App() {
@@ -32,8 +42,11 @@ export default function App() {
     targetLang: 'tr',
     layout: 'side-by-side',
     engine: 'gtx',
-    geminiModel: 'gemini-3-flash-preview',
-    apiKey: '',
+    llmProvider: LLM_PRESETS[0].id,
+    llmBaseUrl: LLM_PRESETS[0].baseUrl,
+    llmModel: LLM_PRESETS[0].model,
+    llmApiKey: '',
+    simplifyLevel: 'off',
     buildGlossary: true,
     customBg: '#f8f9fa',
     customColor: '#495057',
@@ -45,7 +58,7 @@ export default function App() {
     fontFamily: 'sans-serif',
     fontSize: '1em',
     lineSpacing: '1.5',
-    ...storedSettings.config,
+    ...storedConfig(),
   }));
   
   const [progress, setProgress] = useState({ current: 0, total: 0, chapterTitle: '' });
@@ -68,6 +81,31 @@ export default function App() {
   const [dictionaryPos, setDictionaryPos] = useState({ x: 0, y: 0 });
 
   const glossaryTermsRef = useRef<GlossaryTerm[]>([]);
+  const [llmModels, setLlmModels] = useState<string[]>([]);
+  const [llmStatus, setLlmStatus] = useState<{ kind: 'idle' | 'loading' | 'ok' | 'error'; message?: string }>({ kind: 'idle' });
+  const needsLlm = config.engine !== 'gtx' || config.simplifyLevel !== 'off';
+
+  // Shown once per run when the AI engine fails for good and Google Translate takes over.
+  const llmErrorShownRef = useRef(false);
+  const reportLlmError = (err: Error) => {
+    if (llmErrorShownRef.current) return;
+    llmErrorShownRef.current = true;
+    setErrorMsg(`Yapay zeka kullanılamadı, çeviri Google Translate ile sürüyor. (${err.message})`);
+  };
+
+  const handleFetchModels = async () => {
+    setLlmStatus({ kind: 'loading' });
+    try {
+      const models = await listModels(config);
+      setLlmModels(models);
+      setLlmStatus(models.length
+        ? { kind: 'ok', message: `Bağlantı tamam: ${models.length} model bulundu. Model kutusundan seçebilirsiniz.` }
+        : { kind: 'error', message: 'Sunucuya bağlanıldı ama hiç model yok. Önce bir model indirin.' });
+      if (models.length && !config.llmModel.trim()) setConfig(c => ({ ...c, llmModel: models[0] }));
+    } catch (err: any) {
+      setLlmStatus({ kind: 'error', message: err?.message || 'Sunucuya bağlanılamadı.' });
+    }
+  };
   const bookNamesRef = useRef<string[]>([]);
   const [pendingJob, setPendingJob] = useState<PendingJob | null>(null);
 
@@ -108,16 +146,40 @@ export default function App() {
     }
   };
 
-  const handleDownloadBook = (book: SavedBook, e: React.MouseEvent) => {
-    e.stopPropagation();
-    const url = URL.createObjectURL(book.blob);
+  const saveBlob = (blob: Blob, fileName: string) => {
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = book.title;
+    a.download = fileName;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  };
+
+  const handleDownloadBook = (book: SavedBook, e: React.MouseEvent) => {
+    e.stopPropagation();
+    saveBlob(book.blob, book.title);
+  };
+
+  // Which book is being turned into a PDF: 'current' for the one just translated, else a library id.
+  const [pdfBusy, setPdfBusy] = useState<string | null>(null);
+
+  const downloadPdf = async (epub: Blob, epubName: string, busyId: string) => {
+    setPdfBusy(busyId);
+    try {
+      const pdf = await epubToPdf(epub, {
+        title: epubName.replace(/\.epub$/i, '').replace(/_/g, ' '),
+        fontSize: config.fontSize,
+        lineSpacing: config.lineSpacing,
+      });
+      saveBlob(pdf, epubName.replace(/\.epub$/i, '') + '.pdf');
+    } catch (err: any) {
+      console.error('PDF generation failed', err);
+      alert(`PDF oluşturulamadı: ${err?.message || err}`);
+    } finally {
+      setPdfBusy(null);
+    }
   };
 
   const handleReset = () => {
@@ -256,7 +318,7 @@ export default function App() {
       setChapters(parsedChapters);
       setPreviews(initialPreviews);
       
-      // CEFR analysis and recurring names (kept unchanged by Gemini) from the clean text
+      // CEFR analysis and recurring names (kept unchanged by the AI model) from the clean text
       const fullTextSample = analysisTextParts.join(' ').substring(0, 500000);
       const rankTable = await loadRankTable();
       setCefrStats(analyzeCEFR(fullTextSample, rankTable));
@@ -284,11 +346,16 @@ export default function App() {
   // --- Step 3: Processing ---
   const processBook = async () => {
     if (!zipInstance) return;
+    if (needsLlm && !isLlmConfigured(config)) {
+      setErrorMsg('Yapay zeka seçenekleri için sunucu adresi ve model gerekli. Ayarlardaki "Açık Kaynak Yapay Zeka" bölümünü doldurun.');
+      return;
+    }
     setStep(3);
     setIsPaused(false);
     pauseRef.current = false;
     setErrorMsg('');
     
+    llmErrorShownRef.current = false;
     const selectedChapters = chapters.filter(c => c.selected);
     setProgress(p => ({ ...p, total: selectedChapters.length }));
     
@@ -381,6 +448,14 @@ export default function App() {
     const shouldSwap = (config.targetLang === 'en' && config.sourceLang !== 'en') ||
                        (config.sourceLang === 'tr' && config.targetLang !== 'tr');
 
+    // Puts the simplified English in place of the original text, keeping images.
+    const replaceText = (htmlDoc: Document, el: Element, text: string) => {
+      const media = Array.from(el.querySelectorAll('img, svg')).filter(m => !m.parentElement?.closest('svg'));
+      while (el.firstChild) el.removeChild(el.firstChild);
+      media.forEach(m => el.appendChild(m));
+      el.appendChild(htmlDoc.createTextNode(text));
+    };
+
     const applyTranslation = (htmlDoc: Document, el: Element, translation: string) => {
       const originalText = blockText(el);
       const isListItem = el.localName === 'li';
@@ -472,21 +547,32 @@ export default function App() {
           const wave: number[] = [];
           for (let b = start; b < Math.min(start + BATCH_SIZE * PARALLEL_BATCHES, elements.length); b += BATCH_SIZE) wave.push(b);
 
-          const waveResults = await Promise.all(wave.map(batchStart => {
-            const payload = [];
+          const waveResults = await Promise.all(wave.map(async batchStart => {
+            let payload = [];
             for (let k = batchStart; k < Math.min(batchStart + BATCH_SIZE, elements.length); k++) {
               if (texts[k]) payload.push({ id: k, text: texts[k] });
             }
-            if (payload.length === 0) return Promise.resolve([]);
+            if (payload.length === 0) return { translations: [], simplified: new Map<number, string>() };
             const context = {
               precedingText: texts.slice(Math.max(0, batchStart - CONTEXT_PARAGRAPHS), batchStart).filter(Boolean),
               names: bookNamesRef.current,
+              onLlmError: reportLlmError,
             };
-            return translateBatch(payload, config, pauseRef, context);
+            // Graded-reader mode: rewrite the English first (not headings or very short lines),
+            // then translate the rewritten text so both columns say the same thing.
+            const simplified = await simplifyBatch(
+              payload.filter(p => !/^h[1-6]$/.test(elements[p.id].localName) && p.text.split(' ').length >= SIMPLIFY_MIN_WORDS),
+              config, config.simplifyLevel, context,
+            );
+            payload = payload.map(p => ({ id: p.id, text: simplified.get(p.id) ?? p.text }));
+            return { translations: await translateBatch(payload, config, pauseRef, context), simplified };
           }));
           if (pauseRef.current) break;
 
-          waveResults.flat().forEach(t => applyTranslation(htmlDoc, elements[t.id], t.translation));
+          for (const { translations, simplified } of waveResults) {
+            simplified.forEach((text, id) => replaceText(htmlDoc, elements[id], text));
+            translations.forEach(t => applyTranslation(htmlDoc, elements[t.id], t.translation));
+          }
 
           // --- LIVE PREVIEW UPDATE ---
           setPreviews(prev => ({ ...prev, [chapter.id]: previewHtml(htmlDoc) }));
@@ -515,6 +601,13 @@ export default function App() {
         }
       } catch (err) {
         console.error(`Failed to process chapter ${chapter.title}`, err);
+        if (isFatal(err) || (config.simplifyLevel !== 'off' && !isLlmConfigured(config))) {
+          // The model is unreachable: pause so the settings can be fixed and the job resumed.
+          setErrorMsg(`Sadeleştirme durdu: ${(err as Error).message}`);
+          setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'pending' } : c));
+          handlePause();
+          break;
+        }
         setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'error' } : c));
       }
     }
@@ -543,7 +636,7 @@ export default function App() {
       const opfContent = await zipInstance.file(opfPath)?.async("text");
       if (opfContent) {
         const opfDoc = new DOMParser().parseFromString(opfContent, "application/xml");
-        updatePackageMetadata(opfDoc, { sourceLang: config.sourceLang, targetLang: config.targetLang, layout: config.layout });
+        updatePackageMetadata(opfDoc, { sourceLang: config.sourceLang, targetLang: config.targetLang, layout: config.layout, simplifyLevel: config.simplifyLevel });
         if (hasGlossary) {
           addSpineItem(opfDoc, 'auto-glossary', 'glossary.html');
           await addToTableOfContents(zipInstance, opfPath, opfDoc, glossaryPath, 'Sözlük / Glossary', 'auto-glossary');
@@ -595,16 +688,11 @@ export default function App() {
     }
   };
 
+  const outputName = () => file ? file.name.replace('.epub', `_Bilingual_${config.targetLang}.epub`) : 'Bilingual.epub';
+
   const downloadEpub = () => {
     if (!finalBlob || !file) return;
-    const url = URL.createObjectURL(finalBlob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = file.name.replace('.epub', `_Bilingual_${config.targetLang}.epub`);
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    saveBlob(finalBlob, outputName());
   };
 
   const handleTTS = () => {
@@ -793,7 +881,7 @@ export default function App() {
                   {
                     step: "02",
                     title: "Ayarları Yapılandırın",
-                    desc: "Hedef dili seçin, bir çeviri motoru (Gemini veya Google) belirleyin ve tercih ettiğiniz okuma düzenini seçin.",
+                    desc: "Hedef dili seçin, bir çeviri motoru (Google veya açık kaynak yapay zeka) belirleyin ve tercih ettiğiniz okuma düzenini seçin.",
                     icon: <Settings className="w-8 h-8 text-cyan-500" />
                   },
                   {
@@ -861,12 +949,21 @@ export default function App() {
                     <p className={`text-sm mb-4 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
                       {new Date(book.date).toLocaleDateString()} • {book.sourceLang.toUpperCase()} → {book.targetLang.toUpperCase()}
                     </p>
-                    <button 
-                      onClick={(e) => handleDownloadBook(book, e)}
-                      className={`w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkMode ? 'bg-blue-900/30 text-blue-300 hover:bg-blue-900/50' : 'bg-blue-50 text-blue-700 hover:bg-blue-100'}`}
-                    >
-                      <Download className="w-4 h-4" /> İndir
-                    </button>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={(e) => handleDownloadBook(book, e)}
+                        className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors ${isDarkMode ? 'bg-blue-900/30 text-blue-300 hover:bg-blue-900/50' : 'bg-blue-50 text-blue-700 hover:bg-blue-100'}`}
+                      >
+                        <Download className="w-4 h-4" /> EPUB
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); downloadPdf(book.blob, book.title, book.id); }}
+                        disabled={pdfBusy !== null}
+                        className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 rounded-lg font-medium transition-colors disabled:opacity-60 ${isDarkMode ? 'bg-slate-700 text-slate-200 hover:bg-slate-600' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}
+                      >
+                        {pdfBusy === book.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileText className="w-4 h-4" />} PDF
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1093,8 +1190,8 @@ export default function App() {
                         className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-900 border-slate-700 text-white' : 'bg-slate-50 border-slate-300 focus:bg-white'}`}
                       >
                         <option value="gtx">Google Translate (Ücretsiz)</option>
-                        <option value="gtx-fallback">Google Translate + Gemini Yedek</option>
-                        <option value="gemini">Gemini AI (API Key Gerekir)</option>
+                        <option value="gtx-fallback">Google Translate + Yapay Zeka Yedek</option>
+                        <option value="llm">Açık Kaynak Yapay Zeka</option>
                       </select>
                       <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
                         <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
@@ -1102,37 +1199,104 @@ export default function App() {
                     </div>
                   </div>
 
-                  {(config.engine === 'gemini' || config.engine === 'gtx-fallback') && (
-                    <>
-                      <div className="md:col-span-1 space-y-2 animate-fade-in">
-                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Gemini Modeli</label>
-                        <div className="relative">
-                          <select 
-                            value={config.geminiModel} 
-                            onChange={e => setConfig({...config, geminiModel: e.target.value})}
-                            className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-900 border-slate-700 text-white' : 'bg-slate-50 border-slate-300 focus:bg-white'}`}
+                  <div className="space-y-2">
+                    <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Metni Sadeleştir (İngilizce)</label>
+                    <div className="relative">
+                      <select
+                        value={config.simplifyLevel}
+                        onChange={e => setConfig({...config, simplifyLevel: e.target.value as SimplifyLevel})}
+                        className={`w-full appearance-none border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-900 border-slate-700 text-white' : 'bg-slate-50 border-slate-300 focus:bg-white'}`}
+                      >
+                        <option value="off">Kapalı (orijinal metin)</option>
+                        <option value="B2">B2 seviyesine indir</option>
+                        <option value="B1">B1 seviyesine indir</option>
+                        <option value="A2">A2 seviyesine indir</option>
+                      </select>
+                      <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
+                        <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
+                      </div>
+                    </div>
+                    <p className={`text-xs ${isDarkMode ? 'text-slate-500' : 'text-slate-500'}`}>
+                      {config.simplifyLevel === 'off'
+                        ? 'İngilizce metni yapay zeka ile daha kolay bir seviyede yeniden yazar; çeviri de sade metinden yapılır.'
+                        : cefrStats && levelIndex(cefrStats.estimatedLevel) <= levelIndex(config.simplifyLevel)
+                          ? `Bu kitap zaten ${cefrStats.estimatedLevel} seviyesinde; sadeleştirme az şey değiştirir.`
+                          : `Sol sütunda orijinal yerine ${config.simplifyLevel} seviyesinde yeniden yazılmış İngilizce yer alır. Yerel bir modelde uzun bir kitap saatler sürebilir.`}
+                    </p>
+                  </div>
+
+                  {needsLlm && (
+                    <div className={`md:col-span-2 p-5 rounded-2xl border space-y-4 animate-fade-in ${isDarkMode ? 'bg-slate-900 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
+                      <div>
+                        <h4 className={`text-sm font-semibold ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>Açık Kaynak Yapay Zeka</h4>
+                        <p className={`text-xs mt-1 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>Llama, Qwen, Gemma, Mistral gibi açık modelleri kendi bilgisayarınızda ya da bir bulut servisinde kullanın.</p>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <label className={`block text-xs font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Nerede çalışsın?</label>
+                          <select
+                            value={config.llmProvider}
+                            onChange={e => {
+                              const preset = LLM_PRESETS.find(p => p.id === e.target.value)!;
+                              setConfig({ ...config, llmProvider: preset.id, llmBaseUrl: preset.baseUrl || config.llmBaseUrl, llmModel: preset.model });
+                              setLlmModels([]);
+                              setLlmStatus({ kind: 'idle' });
+                            }}
+                            className={`w-full border rounded-xl px-3 py-2.5 outline-none focus:ring-2 focus:ring-blue-500 ${isDarkMode ? 'bg-slate-800 border-slate-700 text-white' : 'bg-white border-slate-300'}`}
                           >
-                            <option value="gemini-3-flash-preview">Gemini 3 Flash (Hızlı ve Ucuz)</option>
-                            <option value="gemini-3.1-flash-lite-preview">Gemini 3.1 Flash-Lite (En Ucuz)</option>
-                            <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro (Yüksek Kalite)</option>
+                            {LLM_PRESETS.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
                           </select>
-                          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-slate-500">
-                            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
+                        </div>
+                        <div className="space-y-2">
+                          <label className={`block text-xs font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Sunucu adresi</label>
+                          <input
+                            value={config.llmBaseUrl}
+                            onChange={e => setConfig({...config, llmBaseUrl: e.target.value})}
+                            placeholder="http://localhost:11434/v1"
+                            className={`w-full border rounded-xl px-3 py-2.5 outline-none focus:ring-2 focus:ring-blue-500 ${isDarkMode ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-300 placeholder-slate-400'}`}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <label className={`block text-xs font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Model</label>
+                          <div className="flex gap-2">
+                            <input
+                              list="llm-models"
+                              value={config.llmModel}
+                              onChange={e => setConfig({...config, llmModel: e.target.value})}
+                              placeholder="ör. gemma3:4b"
+                              className={`flex-1 min-w-0 border rounded-xl px-3 py-2.5 outline-none focus:ring-2 focus:ring-blue-500 ${isDarkMode ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-300 placeholder-slate-400'}`}
+                            />
+                            <datalist id="llm-models">
+                              {llmModels.map(m => <option key={m} value={m} />)}
+                            </datalist>
+                            <button
+                              onClick={handleFetchModels}
+                              disabled={llmStatus.kind === 'loading' || !config.llmBaseUrl.trim()}
+                              className={`shrink-0 px-3 py-2.5 rounded-xl text-sm font-medium border transition-colors disabled:opacity-50 ${isDarkMode ? 'border-slate-700 text-slate-200 hover:bg-slate-800' : 'border-slate-300 text-slate-700 hover:bg-white'}`}
+                            >
+                              {llmStatus.kind === 'loading' ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Modelleri getir'}
+                            </button>
                           </div>
                         </div>
+                        <div className="space-y-2">
+                          <label className={`block text-xs font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+                            API anahtarı {LLM_PRESETS.find(p => p.id === config.llmProvider)?.needsKey ? '' : '(gerekmez)'}
+                          </label>
+                          <input
+                            type="password"
+                            value={config.llmApiKey}
+                            onChange={e => setConfig({...config, llmApiKey: e.target.value})}
+                            placeholder={LLM_PRESETS.find(p => p.id === config.llmProvider)?.needsKey ? 'Anahtarınızı girin...' : 'Yerel sunucu için boş bırakın'}
+                            className={`w-full border rounded-xl px-3 py-2.5 outline-none focus:ring-2 focus:ring-blue-500 ${isDarkMode ? 'bg-slate-800 border-slate-700 text-white placeholder-slate-500' : 'bg-white border-slate-300 placeholder-slate-400'}`}
+                          />
+                        </div>
                       </div>
-                      <div className="md:col-span-1 space-y-2 animate-fade-in">
-                        <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Gemini API Anahtarı</label>
-                        <input 
-                          type="password" 
-                          value={config.apiKey}
-                          onChange={e => setConfig({...config, apiKey: e.target.value})}
-                          placeholder="API anahtarınızı girin..."
-                          className={`w-full border rounded-xl px-4 py-3 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all ${isDarkMode ? 'bg-slate-900 border-slate-700 text-white placeholder-slate-500' : 'bg-slate-50 border-slate-300 focus:bg-white placeholder-slate-400'}`}
-                        />
-                        <p className={`text-xs ${isDarkMode ? 'text-slate-500' : 'text-slate-500'}`}>Anahtarınız yalnızca bu tarayıcıda saklanır ve doğrudan Google'a gönderilir. "Tüm Verileri Sıfırla" ile silebilirsiniz.</p>
-                      </div>
-                    </>
+                      <p className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                        {LLM_PRESETS.find(p => p.id === config.llmProvider)?.hint} Anahtar yalnızca bu tarayıcıda saklanır ve doğrudan seçtiğiniz sunucuya gönderilir.
+                      </p>
+                      {llmStatus.kind === 'ok' && <p className="text-xs font-medium text-emerald-600">{llmStatus.message}</p>}
+                      {llmStatus.kind === 'error' && <p className="text-xs font-medium text-red-600">{llmStatus.message}</p>}
+                    </div>
                   )}
 
                   <div className="md:col-span-2 space-y-3">
@@ -1492,6 +1656,17 @@ export default function App() {
                     <Download className="w-5 h-5" />
                     EPUB Olarak İndir
                   </button>
+                  <button
+                    onClick={() => finalBlob && downloadPdf(finalBlob, outputName(), 'current')}
+                    disabled={pdfBusy !== null}
+                    className={`w-full flex items-center justify-center gap-2 px-4 py-3.5 rounded-xl font-bold transition-all shadow-sm mt-3 relative z-10 disabled:opacity-70 ${isDarkMode ? 'bg-slate-800 text-blue-300 hover:bg-slate-700' : 'bg-white text-blue-700 hover:bg-blue-50'}`}
+                  >
+                    {pdfBusy === 'current' ? <Loader2 className="w-5 h-5 animate-spin" /> : <FileText className="w-5 h-5" />}
+                    {pdfBusy === 'current' ? 'PDF hazırlanıyor...' : 'PDF Olarak İndir'}
+                  </button>
+                  {!pdfSupportsLanguage(config.targetLang) && (
+                    <p className={`text-xs mt-2 relative z-10 ${isDarkMode ? 'text-blue-200' : 'text-blue-100'}`}>PDF yazı tipi bu dilin alfabesini içermiyor; bu dil için EPUB kullanın.</p>
+                  )}
                   <button 
                     onClick={handleReset}
                     className={`w-full flex items-center justify-center gap-2 px-4 py-3.5 rounded-xl font-bold transition-all mt-3 relative z-10 ${isDarkMode ? 'bg-blue-800/50 text-blue-200 hover:bg-blue-700/50' : 'bg-blue-700/30 text-white hover:bg-blue-700/50'}`}

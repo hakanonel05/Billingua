@@ -66,6 +66,16 @@ describe('proper nouns', () => {
   });
 });
 
+describe('analyzeCEFR on real-world text', () => {
+  it('skips contractions (straight or typographic apostrophes) and all-caps names', () => {
+    const stats = analyzeCEFR('The TARDIS landed. I didn’t know. She couldn\'t see the TARDIS.', table);
+    const words = stats.words.map(w => w.word);
+    expect(words).not.toContain('tardis');
+    expect(words.some(w => w.includes("'") || w === 'didn' || w === 't')).toBe(false);
+    expect(stats.total).toBe(7); // the, landed, i, know, she, see, the
+  });
+});
+
 describe('analyzeCEFR', () => {
   const text = 'The cat sat on the mat. The ubiquitous cat was happy. Ishmael Ishmael Ishmael.';
   const stats = analyzeCEFR(text, table);

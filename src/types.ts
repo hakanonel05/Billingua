@@ -9,7 +9,10 @@ export interface TranslationResult {
 }
 
 export type LayoutType = 'side-by-side' | 'columns' | 'interlinear' | 'replace';
-export type EngineType = 'gtx' | 'gemini' | 'gtx-fallback';
+// 'llm': an open-source model through an OpenAI-compatible server; 'gtx-fallback': Google first, the model when it fails.
+export type EngineType = 'gtx' | 'llm' | 'gtx-fallback';
+
+export type SimplifyLevel = 'off' | 'A2' | 'B1' | 'B2';
 
 export interface Chapter {
   id: string;
@@ -25,8 +28,11 @@ export interface AppConfig {
   targetLang: string;
   layout: LayoutType;
   engine: EngineType;
-  geminiModel: string;
-  apiKey: string;
+  llmProvider: string;
+  llmBaseUrl: string;
+  llmModel: string;
+  llmApiKey: string;
+  simplifyLevel: SimplifyLevel;
   buildGlossary: boolean;
   customBg: string;
   customColor: string;
