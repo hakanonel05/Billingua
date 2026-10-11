@@ -137,6 +137,97 @@ export const createPair = (doc: Document, layout: 'side-by-side' | 'columns') =>
   return { container, left, right };
 };
 
+// --- Reading back a book Billingua already translated ---
+// Recognized by the markup this app writes (also in versions before the lang attributes existed):
+// the pair table's cell styles, the .bl-pair/.bl-col columns, the interlinear block style, the
+// glossary highlight spans and the injected stylesheet.
+
+const isPairCell = (el: Element | null | undefined) => {
+  const style = el?.getAttribute('style') || '';
+  return el?.localName === 'td' && /^width: 50%; padding-(left|right): 2%; vertical-align: top;/.test(style);
+};
+const pairCellsOf = (container: Element): Element[] | null => {
+  if (container.localName === 'table') {
+    // Own rows only; a book translated twice has pair tables nested inside the cells.
+    const rows = Array.from(container.children).flatMap(c =>
+      c.localName === 'tr' ? [c] : c.localName === 'tbody' ? Array.from(c.children).filter(r => r.localName === 'tr') : []);
+    const cells = rows.length === 1 ? Array.from(rows[0].children) : [];
+    return cells.length === 2 && cells.every(isPairCell) ? cells : null;
+  }
+  const classes = (container.getAttribute('class') || '').split(/\s+/);
+  if (!classes.includes('bl-pair')) return null;
+  const cols = Array.from(container.children).filter(c => (c.getAttribute('class') || '').split(/\s+/).includes('bl-col'));
+  return cols.length === 2 ? cols : null;
+};
+const hasLang = (el: Element) => el.hasAttribute('lang') || el.hasAttributeNS(XML_NS, 'lang') || el.hasAttribute('xml:lang');
+const INTERLINEAR_STYLE = /padding: 4px 8px; border-radius: 4px; margin-top: 4px;/;
+const HIGHLIGHT_STYLES = new Set(['font-weight: bold;', 'color: #2563eb; font-weight: bold;']);
+
+// Removes a previous Billingua translation from a chapter, restoring the original text so the book
+// can be translated again instead of being doubled. Returns how many paragraphs were restored.
+export const stripPreviousTranslation = (doc: Document): number => {
+  const body = doc.body;
+  if (!body) return 0;
+  let restored = 0;
+
+  // Side-by-side pairs: keep the original cell's content where the pair stood.
+  const containers = [...Array.from(body.getElementsByTagName('table')), ...Array.from(body.getElementsByTagName('div'))]
+    .filter(el => pairCellsOf(el));
+  for (const container of containers) {
+    const cells = pairCellsOf(container)!;
+    // The translated cell holds the element marked with the target language; older versions put
+    // the original on the left.
+    const translatedIndex = cells.findIndex(c => Array.from(c.children).some(hasLang));
+    const original = cells[translatedIndex === 0 ? 1 : 0];
+    const parent = container.parentNode;
+    if (!parent) continue;
+    // In a list item the original was moved into a wrapper div; unwrap it again.
+    const source = parent.nodeType === 1 && (parent as Element).localName === 'li' && original.children.length === 1 && original.firstElementChild?.localName === 'div'
+      ? original.firstElementChild
+      : original;
+    while (source.firstChild) parent.insertBefore(source.firstChild, container);
+    parent.removeChild(container);
+    restored++;
+  }
+
+  // Interlinear translations sit right after (or inside) the original.
+  for (const el of Array.from(body.querySelectorAll('[style]'))) {
+    if (INTERLINEAR_STYLE.test(el.getAttribute('style') || '')) {
+      el.parentNode?.removeChild(el);
+      restored++;
+    }
+  }
+  if (restored === 0) return 0;
+
+  // Glossary highlights inside the original text.
+  for (const span of Array.from(body.getElementsByTagName('span'))) {
+    if (HIGHLIGHT_STYLES.has((span.getAttribute('style') || '').trim())) {
+      while (span.firstChild) span.parentNode?.insertBefore(span.firstChild, span);
+      span.parentNode?.removeChild(span);
+    }
+  }
+  // The stylesheet Billingua added (fonts, columns); a new one is written on export.
+  for (const style of Array.from(doc.getElementsByTagName('style'))) {
+    const css = style.textContent || '';
+    if (css.includes('.bl-pair') || (/font-family:[^;]*!important/.test(css) && /line-height:[^;]*!important/.test(css))) {
+      style.parentNode?.removeChild(style);
+    }
+  }
+  body.normalize();
+  return restored;
+};
+
+// File name without ".epub" and without the suffixes earlier Billingua runs added
+// ("Book_Bilingual_tr.epub", "Book_TR.epub"), so re-translating doesn't grow the name.
+export const baseBookName = (fileName: string) =>
+  fileName.replace(/\.epub$/i, '').replace(/(?:_Bilingual_[a-z]{2}(?:-[A-Za-z]{2})?|_[A-Z]{2}(?:-[A-Z]{2})?)+$/, '') || 'Book';
+
+// Parses a chapter and drops any earlier Billingua translation from it.
+export const loadChapterDoc = (content: string) => {
+  const doc = parseChapterDoc(content);
+  return { doc, restored: stripPreviousTranslation(doc) };
+};
+
 // --- Package (OPF) and navigation ---
 
 const DC_NS = "http://purl.org/dc/elements/1.1/";

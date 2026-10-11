@@ -2,7 +2,7 @@
 import { describe, it, expect } from 'vitest';
 import JSZip from 'jszip';
 import {
-  resolveZipPath, parseChapterDoc, getTranslatableBlocks, highlightTerms, escapeXml,
+  resolveZipPath, parseChapterDoc, getTranslatableBlocks, highlightTerms, escapeXml, stripPreviousTranslation, baseBookName,
   relativeHref, updatePackageMetadata, addSpineItem, addToTableOfContents, buildGlossaryXhtml,
 } from './epub';
 import type { GlossaryTerm } from '../types';
@@ -90,6 +90,67 @@ describe('highlightTerms', () => {
     const doc = parseChapterDoc(xhtml('<p id="p">weighted weights</p>'));
     const p = doc.getElementById('p')!;
     expect(highlightTerms(p, [term('weight', 'x')], 'source').size).toBe(0);
+  });
+});
+
+describe('stripPreviousTranslation', () => {
+  const TD_L = 'width: 50%; padding-right: 2%; vertical-align: top; border-right: 1px solid #ccc;';
+  const TD_R = 'width: 50%; padding-left: 2%; vertical-align: top;';
+  const table = (left: string, right: string) =>
+    `<table style="width: 100%; table-layout: fixed;"><tbody><tr><td style="${TD_L}">${left}</td><td style="${TD_R}">${right}</td></tr></tbody></table>`;
+  const tr = (text: string, tag = 'p') => `<${tag} lang="tr" xml:lang="tr">${text}</${tag}>`;
+  const restore = (body: string) => {
+    const doc = parseChapterDoc(xhtml(body));
+    const count = stripPreviousTranslation(doc);
+    return { count, html: new XMLSerializer().serializeToString(doc.body!).replace(/^<body[^>]*>|<\/body>$/g, '') };
+  };
+
+  it('restores side-by-side tables, keeping the original markup', () => {
+    const { count, html } = restore(
+      table('<h1 id="c1">Chapter One</h1>', tr('Birinci Bölüm', 'h1')) +
+      table('<p>The <i>heavy</i> <span style="font-weight: bold;">weight</span>.</p>', tr('Ağır <span style="font-weight: bold;">yük</span>.')),
+    );
+    expect(count).toBe(2);
+    expect(html).toBe('<h1 id="c1">Chapter One</h1><p>The <i>heavy</i> weight.</p>');
+  });
+
+  it('recognizes output from versions without language tags (original on the left)', () => {
+    expect(restore(table('<p>Hello.</p>', '<p>Merhaba.</p>')).html).toBe('<p>Hello.</p>');
+  });
+
+  it('restores the responsive columns and list items', () => {
+    const pair = (l: string, r: string) => `<div class="bl-pair"><div class="bl-col">${l}</div><div class="bl-col">${r}</div></div>`;
+    const { html } = restore(pair('<p>One.</p>', tr('Bir.')) + `<ul><li>${pair('<div><p>Item.</p></div>', tr('Öğe.', 'div'))}</li></ul>`);
+    expect(html).toBe('<p>One.</p><ul><li><p>Item.</p></li></ul>');
+  });
+
+  it('removes interlinear translations', () => {
+    const inter = '<p lang="tr" style="color: #495057; background-color: #f8f9fa; padding: 4px 8px; border-radius: 4px; margin-top: 4px; font-size: 0.95em; display: block;">Merhaba.</p>';
+    expect(restore(`<p>Hello.</p>${inter}`).html).toBe('<p>Hello.</p>');
+  });
+
+  it('undoes a book that was translated twice', () => {
+    const once = table('<p>Hello.</p>', tr('Merhaba.'));
+    const twice = table(once, table(tr('Merhaba.'), tr('Selam.')));
+    expect(restore(twice).html).toBe('<p>Hello.</p>');
+  });
+
+  it('leaves books that Billingua did not produce alone', () => {
+    const own = '<table><tr><td>Name</td><td>Age</td></tr></table><p><span style="font-weight: bold;">Bold</span> <span lang="fr" xml:lang="fr">bonjour</span></p>';
+    const { count, html } = restore(own);
+    expect(count).toBe(0);
+    expect(html).toContain('<span style="font-weight: bold;">Bold</span>');
+    expect(html).toContain('<td>Name</td>');
+  });
+});
+
+describe('baseBookName', () => {
+  it('drops the suffixes of earlier runs', () => {
+    expect(baseBookName('The_Sontaran_Games-Jacqueline_Rayner.epub')).toBe('The_Sontaran_Games-Jacqueline_Rayner');
+    expect(baseBookName('The_Sontaran_Games-Jacqueline_Rayner_Bilingual_tr_Bilingual_tr.epub')).toBe('The_Sontaran_Games-Jacqueline_Rayner');
+    expect(baseBookName('Moby_Dick_TR_TR.epub')).toBe('Moby_Dick');
+    expect(baseBookName('Book_Bilingual_zh-CN.epub')).toBe('Book');
+    expect(baseBookName('_TR.epub')).toBe('Book');
   });
 });
 

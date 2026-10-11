@@ -4,7 +4,7 @@ import { del, keys } from 'idb-keyval';
 import { BookOpen, UploadCloud, Download, Loader2, CheckCircle, Layout, FileText, AlertCircle, Settings, Play, Pause, Book, Type as TypeIcon, Globe, ArrowLeft, RotateCcw, Library, Moon, Sun, Trash2, Volume2, Square, Zap, Shield, ArrowRight, Layers, X, Info, Gauge, ChevronRight, ChevronDown, Check } from 'lucide-react';
 import { saveBookToLibrary, getLibraryBooks, deleteBookFromLibrary, SavedBook, loadSettings, saveSettings, savePendingJob, loadPendingJob, clearPendingJob, clearTranslationCache, PendingJob } from './lib/db';
 import { analyzeCEFR, getComprehensionPercentage, wordsToLearn, loadRankTable, frequentNames, levelOf, levelIndex, CEFRLevelStats } from './lib/cefr';
-import { XHTML_NS, resolveZipPath, parseChapterDoc, getTranslatableBlocks, highlightTerms, createSampleEpub, createPair, markLanguage, PAIR_CSS, buildGlossaryXhtml, updatePackageMetadata, addSpineItem, addToTableOfContents } from './lib/epub';
+import { XHTML_NS, resolveZipPath, loadChapterDoc, baseBookName, getTranslatableBlocks, highlightTerms, createSampleEpub, createPair, markLanguage, PAIR_CSS, buildGlossaryXhtml, updatePackageMetadata, addSpineItem, addToTableOfContents } from './lib/epub';
 import { translateBatch, simplifyBatch } from './lib/translate';
 import { epubToPdf, pdfSupportsLanguage } from './lib/pdf';
 import { IDIOMS, LANGUAGES } from './constants';
@@ -233,6 +233,7 @@ export default function App() {
       const parsedChapters: Chapter[] = [];
       const initialPreviews: Record<string, string> = {};
       const analysisTextParts: string[] = [];
+      let restoredParagraphs = 0;
       
       for (const itemref of spineItems) {
         const idref = itemref.getAttribute("idref");
@@ -242,7 +243,8 @@ export default function App() {
           const mediaType = manifestItem.getAttribute("media-type") || '';
           const isNavDoc = (manifestItem.getAttribute("properties") || '').split(/\s+/).includes('nav');
           const isHtml = mediaType === 'application/xhtml+xml' || mediaType === 'text/html' || /\.x?html?$/i.test(href?.split('#')[0] || '');
-          if (href && isHtml && !isNavDoc) {
+          // "auto-glossary" is the glossary page of a book Billingua already translated.
+          if (href && isHtml && !isNavDoc && idref !== 'auto-glossary') {
             const fullPath = resolveZipPath(zip, basePath, href);
             
             // Try to extract title from HTML
@@ -250,7 +252,9 @@ export default function App() {
             try {
               const htmlContent = await zip.file(fullPath)?.async("text");
               if (htmlContent) {
-                const htmlDoc = parser.parseFromString(htmlContent, "text/html");
+                // A book Billingua already translated is read back as its original text.
+                const { doc: htmlDoc, restored } = loadChapterDoc(htmlContent);
+                restoredParagraphs += restored;
                 
                 // Store initial preview content
                 initialPreviews[idref || fullPath] = htmlDoc.body.innerHTML;
@@ -303,6 +307,8 @@ export default function App() {
                   // Clean up the title (remove excessive whitespace/newlines)
                   title = extractedTitle.replace(/\s+/g, ' ').substring(0, 60);
                   if (extractedTitle.length > 60) title += '...';
+                } else if (!(htmlDoc.body?.textContent || '').trim() && htmlDoc.querySelector('img, svg, image')) {
+                  title = 'Kapak / Görsel';
                 }
               }
             } catch (e) {}
@@ -330,6 +336,9 @@ export default function App() {
       
       if (parsedChapters.length > 0) {
         setActivePreviewId(parsedChapters[0].id);
+      }
+      if (restoredParagraphs > 0) {
+        setErrorMsg('Bu kitap daha önce Billingua ile çevrilmiş. Önceki çeviri kaldırıldı; orijinal metin yeniden çevrilecek.');
       }
       setStep(2);
     } catch (err: any) {
@@ -385,7 +394,7 @@ export default function App() {
         try {
           const content = await zipInstance.file(chapter.fullPath)?.async("text");
           if (content) {
-            const htmlDoc = parseChapterDoc(content);
+            const htmlDoc = loadChapterDoc(content).doc;
             const text = htmlDoc.body?.textContent || '';
             
             // Extract words. Lowercase occurrences only, which leaves out names.
@@ -545,7 +554,7 @@ export default function App() {
         const content = await zipInstance.file(chapter.fullPath)?.async("text");
         if (!content) throw new Error("File content not found");
 
-        const htmlDoc = parseChapterDoc(content);
+        const htmlDoc = loadChapterDoc(content).doc;
         const elements = getTranslatableBlocks(htmlDoc);
         const texts = elements.map(blockText);
         // What each paragraph became: the (possibly simplified) English and its translation,
@@ -680,7 +689,7 @@ export default function App() {
     setFinalBlob(blob);
 
     // Save to library
-    const bookTitle = file?.name.replace('.epub', '') || 'Translated_Book';
+    const bookTitle = file ? baseBookName(file.name) : 'Translated_Book';
     const savedBook: SavedBook = {
       id: Date.now().toString(),
       title: `${bookTitle}_${config.targetLang.toUpperCase()}.epub`,
@@ -717,7 +726,7 @@ export default function App() {
     }
   };
 
-  const outputName = () => file ? file.name.replace('.epub', `_Bilingual_${config.targetLang}.epub`) : 'Bilingual.epub';
+  const outputName = () => `${file ? baseBookName(file.name) : 'Book'}_Bilingual_${config.targetLang}.epub`;
 
   const downloadEpub = () => {
     if (!finalBlob || !file) return;

@@ -1,7 +1,7 @@
 {
   "name": "billingua",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "İngilizce EPUB kitapları iki dilli (İngilizce-Türkçe) EPUB ve PDF olarak çevirir.",
   "author": "hakanonel05",
   "type": "module",
