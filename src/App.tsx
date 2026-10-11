@@ -5,11 +5,11 @@ import { BookOpen, UploadCloud, Download, Loader2, CheckCircle, Layout, FileText
 import { saveBookToLibrary, getLibraryBooks, deleteBookFromLibrary, SavedBook, loadSettings, saveSettings, savePendingJob, loadPendingJob, clearPendingJob, clearTranslationCache, PendingJob } from './lib/db';
 import { analyzeCEFR, getComprehensionPercentage, wordsToLearn, loadRankTable, frequentNames, levelOf, levelIndex, CEFRLevelStats } from './lib/cefr';
 import { XHTML_NS, resolveZipPath, loadChapterDoc, baseBookName, getTranslatableBlocks, highlightTerms, createSampleEpub, createPair, markLanguage, PAIR_CSS, buildGlossaryXhtml, updatePackageMetadata, addSpineItem, addToTableOfContents } from './lib/epub';
-import { translateBatch, simplifyBatch } from './lib/translate';
+import { translateBatch, simplifyBatch, llmCandidates, hasUsableLlm } from './lib/translate';
 import { epubToPdf, pdfSupportsLanguage } from './lib/pdf';
 import { IDIOMS, LANGUAGES } from './constants';
 import type { LayoutType, EngineType, Chapter, AppConfig, GlossaryTerm, SimplifyLevel } from './types';
-import { LLM_PRESETS, listModels, isLlmConfigured, isFatal } from './lib/llm';
+import { LLM_PRESETS, listModels, isFatal } from './lib/llm';
 
 const storedSettings = loadSettings();
 
@@ -86,12 +86,11 @@ export default function App() {
   const [llmStatus, setLlmStatus] = useState<{ kind: 'idle' | 'loading' | 'ok' | 'error'; message?: string }>({ kind: 'idle' });
   const needsLlm = config.engine !== 'gtx' || config.simplifyLevel !== 'off';
 
-  // Shown once per run when the AI engine fails for good and Google Translate takes over.
-  const llmErrorShownRef = useRef(false);
-  const reportLlmError = (err: Error) => {
-    if (llmErrorShownRef.current) return;
-    llmErrorShownRef.current = true;
-    setErrorMsg(`${err.message} Kalan paragraflar Google Translate ile çevriliyor; Ayarlar'dan başka bir model ya da servis seçebilirsiniz.`);
+  // Told when an AI service fails for good (each service at most once per run, it is then skipped).
+  const reportLlmError = (err: Error, nextService?: string) => {
+    setErrorMsg(nextService
+      ? `${err.message} Çeviri ${nextService} ile sürüyor.`
+      : `${err.message} Kalan paragraflar Google Translate ile çevriliyor. Ayarlar'da başka bir servisin (ör. Groq) anahtarını da girerseniz, kota dolunca otomatik olarak ona geçilir.`);
   };
 
   const handleFetchModels = async () => {
@@ -359,7 +358,7 @@ export default function App() {
   // --- Step 3: Processing ---
   const processBook = async () => {
     if (!zipInstance) return;
-    const llmReady = isLlmConfigured(config);
+    const llmReady = llmCandidates(config).length > 0; // selected service or a saved backup
     // Simplifying needs the model; translating does not, Google Translate takes over.
     if (config.simplifyLevel !== 'off' && !llmReady) {
       setErrorMsg('Metni sadeleştirmek için yapay zeka gerekli. Ayarlardaki "Açık Kaynak Yapay Zeka" bölümünde bir servis seçip anahtarını girin.');
@@ -372,7 +371,6 @@ export default function App() {
       ? 'Yapay zeka için anahtar ya da model girilmedi; çeviri Google Translate ile yapılıyor.'
       : '');
     
-    llmErrorShownRef.current = false;
     const selectedChapters = chapters.filter(c => c.selected);
     setProgress(p => ({ ...p, total: selectedChapters.length }));
     
@@ -565,7 +563,7 @@ export default function App() {
         // Google: a few batches at once. AI model: one batch at a time, so each batch sees how the
         // previous one was translated (without a usable model it's Google again, so in parallel).
         // Results are applied in document order either way.
-        const sequential = config.engine === 'llm' && isLlmConfigured(config);
+        const sequential = config.engine === 'llm' && hasUsableLlm(config);
         const waveSpan = BATCH_SIZE * (sequential ? 1 : PARALLEL_BATCHES);
         for (let start = 0; start < elements.length; start += waveSpan) {
           if (pauseRef.current) break;
@@ -639,7 +637,7 @@ export default function App() {
         }
       } catch (err) {
         console.error(`Failed to process chapter ${chapter.title}`, err);
-        if (isFatal(err) || (config.simplifyLevel !== 'off' && !isLlmConfigured(config))) {
+        if (isFatal(err) || (config.simplifyLevel !== 'off' && !hasUsableLlm(config))) {
           // The model is unreachable: pause so the settings can be fixed and the job resumed.
           setErrorMsg(`Sadeleştirme durdu: ${(err as Error).message}`);
           setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'pending' } : c));

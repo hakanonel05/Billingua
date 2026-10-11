@@ -149,6 +149,32 @@ describe('translateBatch with an open-source model', () => {
     expect(system).toContain('"draft", a machine translation');
   });
 
+  it('moves on to the next AI service with a saved key when one runs out of quota', async () => {
+    const quota = JSON.stringify({ error: { code: 429, message: 'You exceeded your current quota', details: [
+      { violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier', quotaValue: '20' }] }, { retryDelay: '3600s' },
+    ] } });
+    const { gtx, llm } = installNetwork({
+      llmReply: body => (body.model === 'gemini-tired' ? new Response(quota, { status: 429 }) : modelThat(t => `groq:${t}`)(body)),
+    });
+    const notices: [string, string | undefined][] = [];
+    const cfg = config({
+      engine: 'llm', llmProvider: 'google', llmModel: 'gemini-tired', llmApiKey: 'g',
+      llmBaseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', llmKeys: { google: 'g', groq: 'q' },
+    });
+    const ctx = { onLlmError: (e: Error, next?: string) => notices.push([e.message, next]) };
+
+    const first = await translateBatch([{ id: 1, text: 'one' }, { id: 2, text: 'two' }], cfg, notPaused, ctx);
+    expect(first.map(r => r.translation)).toEqual(['groq:one', 'groq:two']);
+    expect(notices).toHaveLength(1);
+    expect(notices[0][0]).toContain('günde 20 istek');
+    expect(notices[0][1]).toContain('Groq');
+
+    const before = llm.length;
+    await translateBatch([{ id: 3, text: 'three' }], cfg, notPaused, ctx);
+    expect(llm.slice(before).map(c => c.body.model)).toEqual(['qwen/qwen3.8-27b']); // Gemini skipped now
+    expect(gtx).toHaveLength(2); // only the drafts
+  });
+
   it('falls back to Google and reports it when the server is down', async () => {
     let reported: Error | undefined;
     const { gtx } = installNetwork({ llmReply: () => { throw new TypeError('Failed to fetch'); } });

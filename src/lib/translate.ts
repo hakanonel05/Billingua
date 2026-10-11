@@ -1,7 +1,7 @@
 import type { MutableRefObject } from 'react';
 import type { AppConfig, SimplifyLevel, TranslationPayload, TranslationResult } from '../types';
 import { getCachedTranslations, setCachedTranslations } from './db';
-import { isFatal, isLlmConfigured, mapParagraphs, type LlmError } from './llm';
+import { isFatal, isLlmConfigured, mapParagraphs, LLM_PRESETS, type LlmError } from './llm';
 
 export interface TranslateContext {
   // Source paragraphs right before this batch, so the model knows who "he" is (AI engine only).
@@ -13,8 +13,9 @@ export interface TranslateContext {
   previousPairs?: { source: string; translation: string }[];
   // Title and author, so the model knows what kind of book it is translating (AI engine only).
   book?: { title?: string; author?: string };
-  // Told when the AI engine fails for good (server down, bad key, quota), so the UI can say so.
-  onLlmError?: (err: Error) => void;
+  // Told when an AI service fails for good (server down, bad key, quota), and which service takes
+  // over (undefined: Google Translate), so the UI can say so.
+  onLlmError?: (err: Error, nextService?: string) => void;
 }
 
 const MAX_CHARS = 2000;
@@ -24,9 +25,53 @@ const LLM_PAUSE_MS = 60_000;
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-// After a fatal error (server down, quota) the model is skipped for a while instead of failing once per batch.
-let llmBlockedUntil = 0;
-const llmAvailable = (config: AppConfig) => isLlmConfigured(config) && Date.now() >= llmBlockedUntil;
+// After a fatal error (server down, quota) a service is skipped for a while instead of failing
+// once per batch. Tracked per service and model, so one spent quota doesn't stop the others.
+const blockedUntil = new Map<string, number>();
+const serviceKey = (c: AppConfig) => `${c.llmBaseUrl.trim()}|${c.llmModel.trim()}`;
+const isAvailable = (c: AppConfig) => (blockedUntil.get(serviceKey(c)) ?? 0) <= Date.now();
+
+// The selected AI service first, then every other cloud service the user saved a key for (with that
+// service's default model): when one runs out of quota the next AI takes over before Google does.
+export const llmCandidates = (config: AppConfig): AppConfig[] => {
+  const candidates = [config];
+  for (const preset of LLM_PRESETS) {
+    const key = config.llmKeys?.[preset.id]?.trim();
+    if (!preset.needsKey || !preset.model || !key || preset.id === config.llmProvider) continue;
+    candidates.push({ ...config, llmProvider: preset.id, llmBaseUrl: preset.baseUrl, llmModel: preset.model, llmApiKey: key });
+  }
+  return candidates.filter(isLlmConfigured);
+};
+
+// Whether any AI service can be used right now.
+export const hasUsableLlm = (config: AppConfig) => llmCandidates(config).some(isAvailable);
+
+const serviceName = (c: AppConfig) => `${LLM_PRESETS.find(p => p.id === c.llmProvider)?.name.split(' — ')[0] ?? c.llmBaseUrl} (${c.llmModel})`;
+
+// Runs `task` on the first AI service that works. A service failing for good (quota, bad key,
+// server down) is skipped for as long as it said, the next one is tried, and `onLlmError` hears
+// what happened and who takes over (undefined: nobody, Google Translate). Other errors end the
+// attempt; whatever succeeded is kept by the caller.
+async function withLlmFallback<T>(
+  config: AppConfig,
+  context: TranslateContext,
+  task: (service: AppConfig) => Promise<T>,
+): Promise<T | undefined> {
+  const services = llmCandidates(config).filter(isAvailable);
+  for (let i = 0; i < services.length; i++) {
+    try {
+      return await task(services[i]);
+    } catch (err) {
+      console.error("AI engine error", err);
+      if (!isFatal(err)) return undefined;
+      // A daily quota stays exhausted for hours: skip the service for as long as it said.
+      blockedUntil.set(serviceKey(services[i]), Date.now() + Math.max(LLM_PAUSE_MS, (err as LlmError).retryAfterMs ?? 0));
+      const next = services.slice(i + 1).find(isAvailable);
+      context.onLlmError?.(err as Error, next ? serviceName(next) : undefined);
+    }
+  }
+  return undefined;
+}
 
 // Set once the /api proxy answers 404 (static hosting), so later requests go straight to Google.
 let proxyMissing = false;
@@ -143,28 +188,40 @@ export async function simplifyBatch(
 ): Promise<Map<number, string>> {
   const results = new Map<number, string>();
   if (level === 'off' || texts.length === 0) return results;
-  if (!isLlmConfigured(config)) throw new Error('Metni sadeleştirmek için bir yapay zeka sunucusu ve model seçin.');
+  if (llmCandidates(config).length === 0) throw new Error('Metni sadeleştirmek için bir yapay zeka sunucusu ve model seçin.');
 
-  const ns = simplifyNamespace(config, level);
-  const key = (text: string) => `${ns}|${text}`;
-  const hits = await getCachedTranslations(texts.map(t => key(t.text)));
-  const pending = texts.filter((t, i) => {
-    if (hits[i]) results.set(t.id, hits[i]!);
-    return !hits[i];
-  });
+  // Earlier rewrites by any of the services.
+  let pending = texts;
+  for (const service of llmCandidates(config)) {
+    const ns = simplifyNamespace(service, level);
+    const hits = await getCachedTranslations(pending.map(t => `${ns}|${t.text}`));
+    pending = pending.filter((t, i) => {
+      if (hits[i]) results.set(t.id, hits[i]!);
+      return !hits[i];
+    });
+  }
   if (pending.length === 0) return results;
 
   let instruction = `You rewrite fiction and non-fiction for English learners at CEFR level ${level}. Rewrite the text in simpler English. ${SIMPLIFY_GUIDE[level]} Keep every event, fact, line of dialogue and name, in the same order; do not summarize, shorten the story or add anything. Keep quotation marks around dialogue.`;
   if (context.names?.length) instruction += ` Keep these names exactly as written: ${context.names.join(', ')}.`;
 
-  const rewritten = await mapParagraphs(config, instruction, pending, context.precedingText);
-  const fresh: [string, string][] = [];
-  rewritten.forEach((text, id) => {
-    const source = pending.find(t => t.id === id)!.text;
-    results.set(id, text);
-    fresh.push([key(source), text]);
+  let lastError: unknown;
+  const done = await withLlmFallback(config, {
+    ...context,
+    onLlmError: (err, next) => { lastError = err; context.onLlmError?.(err, next); },
+  }, async service => {
+    const rewritten = await mapParagraphs(service, instruction, pending, context.precedingText);
+    const ns = simplifyNamespace(service, level);
+    const fresh: [string, string][] = [];
+    rewritten.forEach((text, id) => {
+      results.set(id, text);
+      fresh.push([`${ns}|${pending.find(t => t.id === id)!.text}`, text]);
+    });
+    await setCachedTranslations(fresh);
+    return true;
   });
-  await setCachedTranslations(fresh);
+  // Simplifying has no Google fallback: when every AI service is out, stop and say why.
+  if (!done && lastError) throw lastError;
   return results;
 }
 
@@ -272,7 +329,7 @@ export async function translateBatch(
 ): Promise<TranslationResult[]> {
   const results = new Map<number, string>();
   const fresh: [string, string][] = [];
-  const llmNs = llmNamespace(config);
+  const llmNamespaces = llmCandidates(config).map(llmNamespace);
   const textById = new Map(texts.map(t => [t.id, t.text]));
 
   const record = (ns: string, translated: TranslationResult[]) => {
@@ -287,22 +344,15 @@ export async function translateBatch(
   };
 
   const runLlm = async (items: TranslationPayload[], drafts?: Map<number, string>) => {
-    if (items.length === 0 || !llmAvailable(config)) return;
-    try {
-      record(llmNs, await translateWithLlm(items, config, context, drafts));
-    } catch (err) {
-      console.error("AI engine error", err);
-      if (isFatal(err)) {
-        // A daily quota stays exhausted for hours: skip the model for as long as the service said.
-        llmBlockedUntil = Date.now() + Math.max(LLM_PAUSE_MS, (err as LlmError).retryAfterMs ?? 0);
-        context.onLlmError?.(err as Error);
-      }
-    }
+    if (items.length === 0) return;
+    await withLlmFallback(config, context, async service => {
+      record(llmNamespace(service), await translateWithLlm(items, service, context, drafts));
+    });
   };
 
   // 1. Translations from earlier runs.
-  const namespaces = config.engine === 'llm' ? [llmNs]
-    : config.engine === 'gtx-fallback' ? [GTX_NS, llmNs]
+  const namespaces = config.engine === 'llm' ? llmNamespaces
+    : config.engine === 'gtx-fallback' ? [GTX_NS, ...llmNamespaces]
     : [GTX_NS];
   let pending = texts;
   for (const ns of namespaces) {
