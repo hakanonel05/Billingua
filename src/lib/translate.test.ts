@@ -1,12 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AppConfig } from '../types';
-import { translateBatch, simplifyBatch, chunkByChars } from './translate';
-import { parseJsonReply, mapParagraphs, LlmError, isFatal, stripThinking, isLlmConfigured, chat, parseRateLimit } from './llm';
+import { translateBatch, simplifyBatch, chunkByChars, translateWithLlm, QuotaWaitError } from './translate';
+import { parseJsonReply, parseItemsReply, mapParagraphs, LlmError, isFatal, stripThinking, isLlmConfigured, chat, parseRateLimit } from './llm';
 
 const config = (overrides: Partial<AppConfig> = {}): AppConfig => ({
   sourceLang: 'en', targetLang: 'tr', layout: 'side-by-side', engine: 'gtx',
   llmProvider: 'ollama', llmBaseUrl: 'http://localhost:11434/v1', llmModel: 'test-model', llmApiKey: '', llmKeys: {},
-  simplifyLevel: 'off', buildGlossary: false,
+  simplifyLevel: 'off', whenQuotaRunsOut: 'google', buildGlossary: false,
   customBg: '', customColor: '', minCefrLevel: 'B1', extractIdioms: false,
   contextualGlossary: false, tone: 'default', customGlossary: '',
   fontFamily: 'serif', fontSize: '1em', lineSpacing: '1.5', ...overrides,
@@ -149,30 +149,67 @@ describe('translateBatch with an open-source model', () => {
     expect(system).toContain('"draft", a machine translation');
   });
 
-  it('moves on to the next AI service with a saved key when one runs out of quota', async () => {
-    const quota = JSON.stringify({ error: { code: 429, message: 'You exceeded your current quota', details: [
-      { violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier', quotaValue: '20' }] }, { retryDelay: '3600s' },
-    ] } });
+  const dailyQuota = JSON.stringify({ error: { code: 429, message: 'You exceeded your current quota', details: [
+    { violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier', quotaValue: '20' }] }, { retryDelay: '3600s' },
+  ] } });
+
+  it('uses the other models of the service, then the next service, when quotas run out', async () => {
+    // Every Gemini model is out of quota; Groq works.
     const { gtx, llm } = installNetwork({
-      llmReply: body => (body.model === 'gemini-tired' ? new Response(quota, { status: 429 }) : modelThat(t => `groq:${t}`)(body)),
+      llmReply: body => (String(body.model).startsWith('gemini') ? new Response(dailyQuota, { status: 429 }) : modelThat(t => `groq:${t}`)(body)),
     });
     const notices: [string, string | undefined][] = [];
     const cfg = config({
-      engine: 'llm', llmProvider: 'google', llmModel: 'gemini-tired', llmApiKey: 'g',
+      engine: 'llm', llmProvider: 'google', llmModel: 'gemini-3.8-flash', llmApiKey: 'g',
       llmBaseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', llmKeys: { google: 'g', groq: 'q' },
     });
     const ctx = { onLlmError: (e: Error, next?: string) => notices.push([e.message, next]) };
 
     const first = await translateBatch([{ id: 1, text: 'one' }, { id: 2, text: 'two' }], cfg, notPaused, ctx);
     expect(first.map(r => r.translation)).toEqual(['groq:one', 'groq:two']);
-    expect(notices).toHaveLength(1);
+    expect(llm.map(c => c.body.model)).toEqual([
+      'gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite', 'qwen/qwen3.8-27b',
+    ]);
+    expect(notices.map(n => n[1])).toEqual([
+      'Google AI Studio (gemini-3.7-flash)', 'Google AI Studio (gemini-3.6-flash)', 'Google AI Studio (gemini-3.5-flash)',
+      'Google AI Studio (gemini-3.1-flash-lite)', 'Groq (qwen/qwen3.8-27b)',
+    ]);
     expect(notices[0][0]).toContain('günde 20 istek');
-    expect(notices[0][1]).toContain('Groq');
 
     const before = llm.length;
     await translateBatch([{ id: 3, text: 'three' }], cfg, notPaused, ctx);
-    expect(llm.slice(before).map(c => c.body.model)).toEqual(['qwen/qwen3.8-27b']); // Gemini skipped now
+    expect(llm.slice(before).map(c => c.body.model)).toEqual(['qwen/qwen3.8-27b']); // spent models are skipped now
     expect(gtx).toHaveLength(2); // only the drafts
+  });
+
+  it('pauses instead of finishing with Google when every quota is spent ("wait" mode)', async () => {
+    const { llm } = installNetwork({ llmReply: () => new Response(dailyQuota, { status: 429 }) });
+    const cfg = config({ engine: 'llm', whenQuotaRunsOut: 'wait', llmBaseUrl: 'http://quota.test/v1', llmModel: 'tired' });
+    const pending = translateBatch([{ id: 1, text: 'one' }], cfg, notPaused);
+    await expect(pending).rejects.toBeInstanceOf(QuotaWaitError);
+    await expect(pending).rejects.toMatchObject({ resumeAt: expect.any(Number) });
+    // Asked again while still out of quota: no requests at all, not even Google drafts.
+    const calls = llm.length;
+    await expect(translateBatch([{ id: 2, text: 'two' }], cfg, notPaused)).rejects.toBeInstanceOf(QuotaWaitError);
+    expect(llm.length).toBe(calls);
+  });
+
+  it('does not wait for a server that is down or a bad key: Google takes over', async () => {
+    const { gtx } = installNetwork({ llmReply: () => new Response('{"error":"invalid key"}', { status: 401 }) });
+    const cfg = config({ engine: 'llm', whenQuotaRunsOut: 'wait', llmBaseUrl: 'http://badkey.test/v1' });
+    const out = await translateBatch([{ id: 1, text: 'one' }], cfg, notPaused);
+    expect(out).toEqual([{ id: 1, translation: 'ONE' }]);
+    expect(gtx).toEqual(['one']);
+  });
+
+  it('splits work into requests of the service batch size, each seeing the previous translations', async () => {
+    const { llm } = installNetwork({ llmReply: modelThat(t => `tr:${t}`) });
+    const items = Array.from({ length: 25 }, (_, i) => ({ id: i, text: `p${i}` }));
+    const groq = config({ llmProvider: 'groq', llmApiKey: 'q', llmBaseUrl: 'https://api.groq.com/openai/v1', llmModel: 'qwen/qwen3.8-27b' });
+    const out = await translateWithLlm(items, groq);
+    expect(out).toHaveLength(25);
+    expect(llm).toHaveLength(2); // Groq: 20 per request
+    expect(llm[1].body.messages[1].content).toContain('p19\n=> tr:p19');
   });
 
   it('falls back to Google and reports it when the server is down', async () => {
@@ -277,11 +314,25 @@ describe('llm helpers', () => {
     expect(parseJsonReply('Sure! Here it is: {"items":[{"id":1,"text":"a"}]} Hope it helps.')).toEqual({ items: [{ id: 1, text: 'a' }] });
   });
 
-  it('retries one by one when the batch reply is not JSON', async () => {
+  it('asks for a failed batch once more, then one by one', async () => {
     const { llm } = installNetwork({ llmReply: body => (body.response_format ? 'I cannot do JSON, sorry' : 'ok') });
     const out = await mapParagraphs(config(), 'Do it.', [{ id: 1, text: 'a' }, { id: 2, text: 'b' }]);
     expect(Array.from(out.values())).toEqual(['ok', 'ok']);
-    expect(llm).toHaveLength(3);
+    expect(llm).toHaveLength(4); // batch, batch again, two singles
+  });
+
+  it('keeps the good items of a broken JSON reply and asks only for the rest', async () => {
+    // Item 2 has an unescaped quote, as Gemini Flash-Lite produced with dialogue.
+    const broken = '{"items":[{"id":1,"text":"Bir."},{"id":2,"text":"Dedi ki "merhaba" ve gitti."},{"id":3,"text":"\u00dc\u00e7."}]}';
+    expect(parseItemsReply(broken)).toEqual([{ id: 1, text: 'Bir.' }, { id: 3, text: 'Üç.' }]);
+
+    let call = 0;
+    const { llm } = installNetwork({ llmReply: () => (++call === 1 ? broken : 'İki.') });
+    const out = await mapParagraphs(config(), 'Do it.', [1, 2, 3].map(id => ({ id, text: `t${id}` })));
+    expect(Object.fromEntries(out)).toEqual({ 1: 'Bir.', 2: 'İki.', 3: 'Üç.' });
+    // one more request for the single missing paragraph, not three
+    expect(llm).toHaveLength(2);
+    expect(llm[1].body.messages[1].content).toBe('t2');
   });
 
   it('stops at the first fatal error instead of trying every paragraph', async () => {

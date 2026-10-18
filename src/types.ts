@@ -35,6 +35,8 @@ export interface AppConfig {
   // Keys per service (provider id -> key); llmApiKey is the one for the selected service.
   llmKeys: Record<string, string>;
   simplifyLevel: SimplifyLevel;
+  // When every AI service is out of quota: pause until one is back, or finish with Google Translate.
+  whenQuotaRunsOut: 'wait' | 'google';
   buildGlossary: boolean;
   customBg: string;
   customColor: string;

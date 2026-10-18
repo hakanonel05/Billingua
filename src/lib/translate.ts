@@ -1,7 +1,7 @@
 import type { MutableRefObject } from 'react';
 import type { AppConfig, SimplifyLevel, TranslationPayload, TranslationResult } from '../types';
 import { getCachedTranslations, setCachedTranslations } from './db';
-import { isFatal, isLlmConfigured, mapParagraphs, LLM_PRESETS, type LlmError } from './llm';
+import { isFatal, isLlmConfigured, mapParagraphs, batchSizeOf, LLM_PRESETS, type LlmError } from './llm';
 
 export interface TranslateContext {
   // Source paragraphs right before this batch, so the model knows who "he" is (AI engine only).
@@ -27,21 +27,45 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 // After a fatal error (server down, quota) a service is skipped for a while instead of failing
 // once per batch. Tracked per service and model, so one spent quota doesn't stop the others.
-const blockedUntil = new Map<string, number>();
+// `quota`: blocked by a rate limit, which clears by waiting (a bad key or a down server doesn't).
+const blocked = new Map<string, { until: number; quota: boolean }>();
 const serviceKey = (c: AppConfig) => `${c.llmBaseUrl.trim()}|${c.llmModel.trim()}`;
-const isAvailable = (c: AppConfig) => (blockedUntil.get(serviceKey(c)) ?? 0) <= Date.now();
+const isAvailable = (c: AppConfig) => (blocked.get(serviceKey(c))?.until ?? 0) <= Date.now();
 
-// The selected AI service first, then every other cloud service the user saved a key for (with that
-// service's default model): when one runs out of quota the next AI takes over before Google does.
+// Every AI service and model that may translate, in order: the selected model, the selected
+// service's other models (quotas are counted per model), then every other cloud service the user
+// saved a key for with its models. When one runs out of quota the next takes over before Google does.
 export const llmCandidates = (config: AppConfig): AppConfig[] => {
-  const candidates = [config];
+  const withModels = (base: AppConfig, models: (string | undefined)[]) =>
+    [...new Set(models.filter((m): m is string => !!m?.trim()))].map(llmModel => ({ ...base, llmModel }));
+
+  const selected = LLM_PRESETS.find(p => p.id === config.llmProvider);
+  const candidates = withModels(config, [config.llmModel, ...(selected?.backupModels ?? [])]);
   for (const preset of LLM_PRESETS) {
     const key = config.llmKeys?.[preset.id]?.trim();
     if (!preset.needsKey || !preset.model || !key || preset.id === config.llmProvider) continue;
-    candidates.push({ ...config, llmProvider: preset.id, llmBaseUrl: preset.baseUrl, llmModel: preset.model, llmApiKey: key });
+    const base = { ...config, llmProvider: preset.id, llmBaseUrl: preset.baseUrl, llmModel: preset.model, llmApiKey: key };
+    candidates.push(...withModels(base, [preset.model, ...(preset.backupModels ?? [])]));
   }
   return candidates.filter(isLlmConfigured);
 };
+
+// When the first AI service that ran out of quota gets it back (ms since epoch), or null if none did.
+export const llmAvailableAt = (config: AppConfig): number | null => {
+  const times = llmCandidates(config)
+    .map(c => blocked.get(serviceKey(c)))
+    .filter(b => b?.quota && b.until > Date.now())
+    .map(b => b!.until);
+  return times.length ? Math.min(...times) : null;
+};
+
+// Thrown in "wait" mode when every AI service is out of quota: the job pauses until `resumeAt`
+// instead of finishing the book with Google Translate.
+export class QuotaWaitError extends Error {
+  constructor(readonly resumeAt: number) {
+    super('Bütün yapay zeka kotaları doldu.');
+  }
+}
 
 // Whether any AI service can be used right now.
 export const hasUsableLlm = (config: AppConfig) => llmCandidates(config).some(isAvailable);
@@ -65,7 +89,10 @@ async function withLlmFallback<T>(
       console.error("AI engine error", err);
       if (!isFatal(err)) return undefined;
       // A daily quota stays exhausted for hours: skip the service for as long as it said.
-      blockedUntil.set(serviceKey(services[i]), Date.now() + Math.max(LLM_PAUSE_MS, (err as LlmError).retryAfterMs ?? 0));
+      blocked.set(serviceKey(services[i]), {
+        until: Date.now() + Math.max(LLM_PAUSE_MS, (err as LlmError).retryAfterMs ?? 0),
+        quota: (err as LlmError).status === 429,
+      });
       const next = services.slice(i + 1).find(isAvailable);
       context.onLlmError?.(err as Error, next ? serviceName(next) : undefined);
     }
@@ -122,11 +149,15 @@ export const chunkByChars = (items: TranslationPayload[], maxChars = MAX_CHARS):
 
 // --- Open-source model (OpenAI-compatible server) ---
 
+// Translates with one AI service, in requests of that service's batch size. Each request after the
+// first sees how the paragraphs just before it were translated. `onResults` hears each request's
+// results as they arrive, so a quota that runs out half-way keeps what was already done.
 export async function translateWithLlm(
   texts: TranslationPayload[],
   config: AppConfig,
   context: TranslateContext = {},
   drafts: Map<number, string> = new Map(),
+  onResults?: (results: TranslationResult[]) => void,
 ): Promise<TranslationResult[]> {
   const target = languageName(config.targetLang);
   const lines = [`You are an experienced literary translator from ${languageName(config.sourceLang)} into ${target}.`];
@@ -155,16 +186,30 @@ export async function translateWithLlm(
 
   // Earlier source paragraphs with the translations already chosen for them; the source alone
   // when nothing has been translated yet.
-  let contextBlock: string | string[] = context.precedingText || [];
-  if (context.previousPairs?.length) {
-    contextBlock = 'The previous passage and how it was translated, for consistency only (do not include it in the output):\n"""\n'
-      + context.previousPairs.map(p => `${p.source}\n=> ${p.translation}`).join('\n\n')
-      + '\n"""';
-  }
+  const contextFor = (pairs: { source: string; translation: string }[] | undefined, preceding: string[]): string | string[] =>
+    pairs?.length
+      ? 'The previous passage and how it was translated, for consistency only (do not include it in the output):\n"""\n'
+        + pairs.map(p => `${p.source}\n=> ${p.translation}`).join('\n\n')
+        + '\n"""'
+      : preceding;
 
-  const items = texts.map(t => (drafts.has(t.id) ? { ...t, draft: drafts.get(t.id) } : t));
-  const translated = await mapParagraphs(config, lines.join('\n'), items, contextBlock);
-  return Array.from(translated, ([id, translation]) => ({ id, translation }));
+  const instruction = lines.join('\n');
+  const batchSize = batchSizeOf(config);
+  const all: TranslationResult[] = [];
+  let pairs = context.previousPairs;
+  let preceding = context.precedingText || [];
+  for (let start = 0; start < texts.length; start += batchSize) {
+    const batch = texts.slice(start, start + batchSize);
+    const items = batch.map(t => (drafts.has(t.id) ? { ...t, draft: drafts.get(t.id) } : t));
+    const translated = await mapParagraphs(config, instruction, items, contextFor(pairs, preceding));
+    const results = Array.from(translated, ([id, translation]) => ({ id, translation }));
+    all.push(...results);
+    onResults?.(results);
+    const tail = batch.slice(-3);
+    pairs = tail.filter(t => translated.has(t.id)).map(t => ({ source: t.text, translation: translated.get(t.id)! }));
+    preceding = tail.map(t => t.text);
+  }
+  return all;
 }
 
 // --- Simplification (graded-reader rewrite) ---
@@ -343,10 +388,12 @@ export async function translateBatch(
     }
   };
 
+  // Each service starts from what the previous ones left untranslated.
   const runLlm = async (items: TranslationPayload[], drafts?: Map<number, string>) => {
     if (items.length === 0) return;
     await withLlmFallback(config, context, async service => {
-      record(llmNamespace(service), await translateWithLlm(items, service, context, drafts));
+      const remaining = items.filter(t => !results.has(t.id));
+      if (remaining.length) await translateWithLlm(remaining, service, context, drafts, r => record(llmNamespace(service), r));
     });
   };
 
@@ -371,12 +418,25 @@ export async function translateBatch(
   // the meaning), then the model turns them into natural, consistent prose. Paragraphs the model
   // can't do keep their Google draft.
   if (config.engine === 'llm' && pending.length) {
+    // "wait" (default): when every AI service is out of quota, pause until one is back instead of
+    // finishing the book with Google Translate, which has no context.
+    const waitForQuota = config.whenQuotaRunsOut !== 'google' && llmCandidates(config).length > 0;
+    const pauseIfOutOfQuota = async () => {
+      const resumeAt = llmAvailableAt(config);
+      if (waitForQuota && !hasUsableLlm(config) && resumeAt) {
+        await setCachedTranslations(fresh); // keep what the AI already did
+        throw new QuotaWaitError(resumeAt);
+      }
+    };
+    await pauseIfOutOfQuota();
+
     const drafts = new Map<number, string>();
     for (const chunk of chunkByChars(pending)) {
       if (pauseRef.current) break;
       for (const r of await translateChunkGtx(chunk, config, pauseRef, async () => {})) drafts.set(r.id, r.translation);
     }
     await runLlm(pending, drafts);
+    if (pending.some(t => !results.has(t.id))) await pauseIfOutOfQuota();
     record(GTX_NS, pending.filter(t => drafts.has(t.id)).map(t => ({ id: t.id, translation: drafts.get(t.id)! })));
     pending = pending.filter(t => !results.has(t.id));
   }

@@ -5,11 +5,11 @@ import { BookOpen, UploadCloud, Download, Loader2, CheckCircle, Layout, FileText
 import { saveBookToLibrary, getLibraryBooks, deleteBookFromLibrary, SavedBook, loadSettings, saveSettings, savePendingJob, loadPendingJob, clearPendingJob, clearTranslationCache, PendingJob } from './lib/db';
 import { analyzeCEFR, getComprehensionPercentage, wordsToLearn, loadRankTable, frequentNames, levelOf, levelIndex, CEFRLevelStats } from './lib/cefr';
 import { XHTML_NS, resolveZipPath, loadChapterDoc, baseBookName, getTranslatableBlocks, highlightTerms, createSampleEpub, createPair, markLanguage, PAIR_CSS, buildGlossaryXhtml, updatePackageMetadata, addSpineItem, addToTableOfContents } from './lib/epub';
-import { translateBatch, simplifyBatch, llmCandidates, hasUsableLlm } from './lib/translate';
+import { translateBatch, simplifyBatch, llmCandidates, hasUsableLlm, QuotaWaitError } from './lib/translate';
 import { epubToPdf, pdfSupportsLanguage } from './lib/pdf';
 import { IDIOMS, LANGUAGES } from './constants';
 import type { LayoutType, EngineType, Chapter, AppConfig, GlossaryTerm, SimplifyLevel } from './types';
-import { LLM_PRESETS, listModels, isFatal } from './lib/llm';
+import { LLM_PRESETS, listModels, isFatal, batchSizeOf } from './lib/llm';
 
 const storedSettings = loadSettings();
 
@@ -48,6 +48,7 @@ export default function App() {
     llmApiKey: '',
     llmKeys: {},
     simplifyLevel: 'off',
+    whenQuotaRunsOut: 'wait',
     buildGlossary: true,
     customBg: '#f8f9fa',
     customColor: '#495057',
@@ -563,16 +564,19 @@ export default function App() {
         // Google: a few batches at once. AI model: one batch at a time, so each batch sees how the
         // previous one was translated (without a usable model it's Google again, so in parallel).
         // Results are applied in document order either way.
+        // AI batches are as large as the selected service allows (Gemini: 50 paragraphs per request,
+        // since its free quota counts requests), so a book needs few requests.
         const sequential = config.engine === 'llm' && hasUsableLlm(config);
-        const waveSpan = BATCH_SIZE * (sequential ? 1 : PARALLEL_BATCHES);
+        const batchSize = sequential ? batchSizeOf(config) : BATCH_SIZE;
+        const waveSpan = batchSize * (sequential ? 1 : PARALLEL_BATCHES);
         for (let start = 0; start < elements.length; start += waveSpan) {
           if (pauseRef.current) break;
           const wave: number[] = [];
-          for (let b = start; b < Math.min(start + waveSpan, elements.length); b += BATCH_SIZE) wave.push(b);
+          for (let b = start; b < Math.min(start + waveSpan, elements.length); b += batchSize) wave.push(b);
 
           const waveResults = await Promise.all(wave.map(async batchStart => {
             let payload = [];
-            for (let k = batchStart; k < Math.min(batchStart + BATCH_SIZE, elements.length); k++) {
+            for (let k = batchStart; k < Math.min(batchStart + batchSize, elements.length); k++) {
               if (texts[k]) payload.push({ id: k, text: texts[k] });
             }
             if (payload.length === 0) return { translations: [], simplified: new Map<number, string>() };
@@ -636,6 +640,16 @@ export default function App() {
           processedCount++;
         }
       } catch (err) {
+        if (err instanceof QuotaWaitError) {
+          // Every AI service is out of quota: pause and pick up again when the first one is back.
+          // Paragraphs already translated are in the cache and won't be asked for again.
+          const resumeAt = new Date(err.resumeAt);
+          setErrorMsg(`Bütün yapay zeka kotaları doldu. Kitabın kalanını bağlamsız Google Translate ile bitirmek yerine çeviri duraklatıldı; kota ${resumeAt.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })} civarında yenilenince kendiliğinden devam edecek (uygulama açık kalmalı). İstersen Ayarlar'dan "Kotalar bitince: Google Translate ile devam et"i seçebilirsin.`);
+          setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'pending' } : c));
+          handlePause();
+          scheduleResume(err.resumeAt);
+          break;
+        }
         console.error(`Failed to process chapter ${chapter.title}`, err);
         if (isFatal(err) || (config.simplifyLevel !== 'off' && !hasUsableLlm(config))) {
           // The model is unreachable: pause so the settings can be fixed and the job resumed.
@@ -708,13 +722,26 @@ export default function App() {
   };
 
   const handleResume = () => {
+    clearTimeout(resumeTimerRef.current);
     pauseRef.current = false;
     setIsPaused(false);
     processBook();
   };
 
+  // Automatic resume after a quota pause. The timer calls the latest handleResume, not the one
+  // from the render that set it, so the job continues with the current chapter list.
+  const resumeTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const latestResumeRef = useRef(handleResume);
+  latestResumeRef.current = handleResume;
+  const scheduleResume = (at: number) => {
+    clearTimeout(resumeTimerRef.current);
+    resumeTimerRef.current = setTimeout(() => latestResumeRef.current(), Math.max(5_000, at - Date.now() + 5_000));
+  };
+  useEffect(() => () => clearTimeout(resumeTimerRef.current), []);
+
   const handleCancelTranslation = () => {
     if (confirm('Çeviriyi iptal etmek istediğinizden emin misiniz? (Mevcut bölüm çevirisi durdurulacak)')) {
+      clearTimeout(resumeTimerRef.current);
       pauseRef.current = true;
       setStep(2);
       // Reset statuses of processing chapters back to pending
@@ -1332,6 +1359,20 @@ export default function App() {
                       <p className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
                         {LLM_PRESETS.find(p => p.id === config.llmProvider)?.hint} Anahtar yalnızca bu tarayıcıda saklanır ve doğrudan seçtiğiniz sunucuya gönderilir.
                       </p>
+                      <div className="space-y-2">
+                        <label className={`block text-xs font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Kotalar bitince</label>
+                        <select
+                          value={config.whenQuotaRunsOut}
+                          onChange={e => setConfig({ ...config, whenQuotaRunsOut: e.target.value as AppConfig['whenQuotaRunsOut'] })}
+                          className={`w-full border rounded-xl px-3 py-2.5 outline-none focus:ring-2 focus:ring-blue-500 ${isDarkMode ? 'bg-slate-800 border-slate-700 text-white' : 'bg-white border-slate-300'}`}
+                        >
+                          <option value="wait">Bekle, kota yenilenince kaldığı yerden devam et (önerilen)</option>
+                          <option value="google">Kalanını Google Translate ile bitir (bağlamsız, daha düşük kalite)</option>
+                        </select>
+                        <p className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                          Önce seçili model, sonra aynı servisin diğer modelleri, sonra anahtarını girdiğin diğer servisler denenir. Hepsinin kotası biterse bu seçenek geçerli olur.
+                        </p>
+                      </div>
                       {llmStatus.kind === 'ok' && <p className="text-xs font-medium text-emerald-600">{llmStatus.message}</p>}
                       {llmStatus.kind === 'error' && <p className="text-xs font-medium text-red-600">{llmStatus.message}</p>}
                     </div>

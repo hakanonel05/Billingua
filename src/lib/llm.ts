@@ -16,6 +16,12 @@ export interface LlmPreset {
   model: string;
   needsKey: boolean;
   hint: string;
+  // Paragraphs per request. Services limited by requests per day (Gemini) get large batches;
+  // services limited by tokens per minute (Groq: 8,000) get batches that fit the limit.
+  batchParagraphs: number;
+  // Other models of the same service, tried in order when the chosen one runs out of quota
+  // (quotas are counted per model).
+  backupModels?: string[];
 }
 
 // The first preset is the default: an open model, fast and free (needs a free key).
@@ -26,15 +32,18 @@ export const LLM_PRESETS: LlmPreset[] = [
     baseUrl: 'https://api.groq.com/openai/v1',
     model: 'qwen/qwen3.8-27b',
     needsKey: true,
-    hint: 'console.groq.com adresinden ücretsiz bir anahtar alın. Qwen modeli Türkçe edebi çeviride Google\'dan belirgin şekilde iyi sonuç veriyor.',
+    hint: 'console.groq.com adresinden ücretsiz bir anahtar alın. Qwen modeli Türkçe edebi çeviride Google\'dan belirgin şekilde iyi sonuç veriyor. Ücretsiz katman: günde yaklaşık 200.000 token (yaklaşık 1.000 paragraf).',
+    batchParagraphs: 20,
   },
   {
     id: 'google',
     name: 'Google AI Studio — Gemini (Google API anahtarıyla)',
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
-    model: 'gemini-3.5-flash-lite',
+    model: 'gemini-3.8-flash',
     needsKey: true,
-    hint: 'aistudio.google.com/apikey adresinden anahtar alın. Ücretsiz katmanda gemini-3.8-flash günde yalnızca 20 istek verir (bir kitap için yetmez); varsayılan gemini-3.5-flash-lite daha bol kotalıdır. Gemini açık kaynak değildir; buradaki açık Gemma modelleri ise çok yavaştır. Kalan kotanızı aistudio.google.com/rate-limit sayfasında görebilirsiniz.',
+    hint: 'aistudio.google.com/apikey adresinden anahtar alın. Ücretsiz katmanda her Gemini modeli günde ayrı bir istek kotasına sahip; uygulama tek istekte 50 paragraf gönderir ve kota dolunca sırayla 3.7, 3.6, 3.5 Flash modellerine geçer. Gemini açık kaynak değildir; buradaki açık Gemma modelleri ise çok yavaştır. Kalan kotanızı aistudio.google.com/rate-limit sayfasında görebilirsiniz.',
+    batchParagraphs: 50,
+    backupModels: ['gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'],
   },
   {
     id: 'ollama',
@@ -43,6 +52,7 @@ export const LLM_PRESETS: LlmPreset[] = [
     model: 'gemma3:4b',
     needsKey: false,
     hint: 'ollama.com adresinden kurun, sonra terminalde: ollama pull gemma3:4b. Daha iyi sonuç için daha büyük bir model (gemma3:12b, qwen2.5:14b) seçin.',
+    batchParagraphs: 10,
   },
   {
     id: 'lmstudio',
@@ -51,6 +61,7 @@ export const LLM_PRESETS: LlmPreset[] = [
     model: '',
     needsKey: false,
     hint: 'LM Studio\'da bir model indirin, Developer sekmesinden sunucuyu başlatın ve "Enable CORS" seçeneğini açın.',
+    batchParagraphs: 10,
   },
   {
     id: 'openrouter',
@@ -58,7 +69,8 @@ export const LLM_PRESETS: LlmPreset[] = [
     baseUrl: 'https://openrouter.ai/api/v1',
     model: '',
     needsKey: true,
-    hint: 'openrouter.ai adresinden anahtar alın, sonra "Modelleri getir" ile bir açık model (Llama, Qwen, Gemma, Mistral) seçin.',
+    hint: 'openrouter.ai adresinden anahtar alın, sonra "Modelleri getir" ile bir açık model (Llama, Qwen, Gemma, Mistral) seçin. Ücretsiz modellerde günde 50 istek sınırı vardır.',
+    batchParagraphs: 30,
   },
   {
     id: 'custom',
@@ -67,8 +79,12 @@ export const LLM_PRESETS: LlmPreset[] = [
     model: '',
     needsKey: false,
     hint: 'llama.cpp, vLLM gibi OpenAI uyumlu (/v1/chat/completions) her sunucu çalışır.',
+    batchParagraphs: 10,
   },
 ];
+
+// Paragraphs per request for a service; unknown servers get a safe default.
+export const batchSizeOf = (s: LlmSettings) => presetOf(s)?.batchParagraphs ?? 10;
 
 export const presetOf = (s: LlmSettings) => LLM_PRESETS.find(p => p.id === s.llmProvider);
 
@@ -254,6 +270,32 @@ export function parseJsonReply(reply: string): any {
   }
 }
 
+// The items of a batch reply, even a broken one: when the reply as a whole doesn't parse (a model
+// left a quote unescaped inside one translation), every item that is still well-formed is kept.
+export function parseItemsReply(reply: string): { id: number; text: string }[] {
+  try {
+    const parsed = parseJsonReply(reply);
+    const list = Array.isArray(parsed) ? parsed : parsed?.items;
+    if (Array.isArray(list)) {
+      return list
+        .map((r: any) => ({ id: Number(r?.id), text: r?.text ?? r?.translation }))
+        .filter(r => Number.isInteger(r.id) && typeof r.text === 'string');
+    }
+  } catch {
+    // fall through to item-by-item salvage
+  }
+  const salvaged: { id: number; text: string }[] = [];
+  const item = /\{\s*"id"\s*:\s*"?(\d+)"?\s*,\s*"(?:text|translation)"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}/g;
+  for (const m of reply.matchAll(item)) {
+    try {
+      salvaged.push({ id: Number(m[1]), text: JSON.parse(`"${m[2]}"`) });
+    } catch {
+      // this one is broken too
+    }
+  }
+  return salvaged;
+}
+
 export interface IdText {
   id: number;
   text: string;
@@ -261,9 +303,11 @@ export interface IdText {
   draft?: string;
 }
 
-// Runs one instruction over a batch of paragraphs. The batch goes out as one JSON request; when a
-// (small, local) model returns broken JSON or skips items, the missing ones are retried one by one
-// as plain text, which even weak models handle. Returns whatever came back; failures are omitted.
+// Runs one instruction over a batch of paragraphs. The batch goes out as one JSON request; items
+// missing from the reply (broken JSON, skipped items) are asked for again together, once, and only
+// what is still missing after that goes out one by one as plain text, which even weak models handle.
+// Quota-limited services thus pay one or two requests per batch, not one per paragraph.
+// Returns whatever came back; failures are omitted.
 // `context` is either the preceding source paragraphs or a ready-made context block.
 export async function mapParagraphs(
   s: LlmSettings,
@@ -278,25 +322,26 @@ export async function mapParagraphs(
       ? `The passage just before these texts, for context only (do not include it in the output):\n"""\n${context.join('\n\n')}\n"""\n\n`
       : '';
 
-  if (items.length > 1) {
+  const wanted = new Set(items.map(i => i.id));
+  const askBatch = async (batch: IdText[]) => {
     try {
       const reply = await chat(s, [
-        { role: 'system', content: `${instruction}\nAnswer only with JSON of the form {"items":[{"id":<number>,"text":"<result>"}]}, one item per input, same ids, nothing else.` },
-        { role: 'user', content: `${contextBlock}${JSON.stringify({ items })}` },
+        { role: 'system', content: `${instruction}\nAnswer only with JSON of the form {"items":[{"id":<number>,"text":"<result>"}]}, one item per input, same ids, nothing else. Escape double quotes inside the text as \\".` },
+        { role: 'user', content: `${contextBlock}${JSON.stringify({ items: batch })}` },
       ], { json: true });
-      const parsed = parseJsonReply(reply);
-      const list = Array.isArray(parsed) ? parsed : parsed?.items;
-      const wanted = new Set(items.map(i => i.id));
-      if (Array.isArray(list)) {
-        for (const r of list) {
-          const text = r?.text ?? r?.translation;
-          if (wanted.has(r?.id) && typeof text === 'string' && text.trim()) results.set(r.id, text.trim());
-        }
+      for (const r of parseItemsReply(reply)) {
+        if (wanted.has(r.id) && r.text.trim()) results.set(r.id, r.text.trim());
       }
     } catch (err) {
       if (isFatal(err)) throw err;
-      console.warn('Batch request failed; retrying paragraphs one by one', err);
+      console.warn('Batch request failed', err);
     }
+  };
+
+  if (items.length > 1) {
+    await askBatch(items);
+    const missing = items.filter(i => !results.has(i.id));
+    if (missing.length > 1) await askBatch(missing);
   }
 
   for (const item of items) {
