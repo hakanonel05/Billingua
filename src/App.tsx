@@ -20,6 +20,15 @@ const storedConfig = (): Partial<AppConfig> => {
   return rest;
 };
 
+// "2 saat 5 dakika", "12 dakika", "1 dakikadan az"
+const formatWait = (ms: number) => {
+  const minutes = Math.max(0, Math.ceil(ms / 60_000));
+  if (minutes < 1) return '1 dakikadan az';
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return h ? `${h} saat${m ? ` ${m} dakika` : ''}` : `${m} dakika`;
+};
+
 const BATCH_SIZE = 10;        // paragraphs per translation request
 const PARALLEL_BATCHES = 3;   // requests in flight at once
 const CONTEXT_PARAGRAPHS = 3; // preceding paragraphs sent to the AI model as context
@@ -83,6 +92,16 @@ export default function App() {
   const [dictionaryPos, setDictionaryPos] = useState({ x: 0, y: 0 });
 
   const glossaryTermsRef = useRef<GlossaryTerm[]>([]);
+  // Set while the job waits for an AI quota to come back (ms since epoch).
+  const [quotaResumeAt, setQuotaResumeAt] = useState<number | null>(null);
+  // Ticks once a minute during that wait so the countdown stays current.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!quotaResumeAt) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, [quotaResumeAt]);
   const [llmModels, setLlmModels] = useState<string[]>([]);
   const [llmStatus, setLlmStatus] = useState<{ kind: 'idle' | 'loading' | 'ok' | 'error'; message?: string }>({ kind: 'idle' });
   const needsLlm = config.engine !== 'gtx' || config.simplifyLevel !== 'off';
@@ -185,6 +204,8 @@ export default function App() {
   };
 
   const handleReset = () => {
+    clearTimeout(resumeTimerRef.current);
+    setQuotaResumeAt(null);
     setStep(1);
     setFile(null);
     setZipInstance(null);
@@ -599,7 +620,8 @@ export default function App() {
               config, config.simplifyLevel, context,
             );
             payload = payload.map(p => ({ id: p.id, text: simplified.get(p.id) ?? p.text }));
-            return { translations: await translateBatch(payload, config, pauseRef, context), simplified };
+            const jobConfig = googleForThisJobRef.current ? { ...config, whenQuotaRunsOut: 'google' as const } : config;
+            return { translations: await translateBatch(payload, jobConfig, pauseRef, context), simplified };
           }));
           if (pauseRef.current) break;
 
@@ -643,8 +665,8 @@ export default function App() {
         if (err instanceof QuotaWaitError) {
           // Every AI service is out of quota: pause and pick up again when the first one is back.
           // Paragraphs already translated are in the cache and won't be asked for again.
-          const resumeAt = new Date(err.resumeAt);
-          setErrorMsg(`Bütün yapay zeka kotaları doldu. Kitabın kalanını bağlamsız Google Translate ile bitirmek yerine çeviri duraklatıldı; kota ${resumeAt.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })} civarında yenilenince kendiliğinden devam edecek (uygulama açık kalmalı). İstersen Ayarlar'dan "Kotalar bitince: Google Translate ile devam et"i seçebilirsin.`);
+          setErrorMsg('');
+          setQuotaResumeAt(err.resumeAt);
           setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'pending' } : c));
           handlePause();
           scheduleResume(err.resumeAt);
@@ -723,8 +745,21 @@ export default function App() {
 
   const handleResume = () => {
     clearTimeout(resumeTimerRef.current);
+    setQuotaResumeAt(null);
     pauseRef.current = false;
     setIsPaused(false);
+    processBook();
+  };
+
+  // "Google Translate ile şimdi devam et" on the quota pause: finishes this book with Google
+  // without changing the saved setting.
+  const googleForThisJobRef = useRef(false);
+  const continueWithGoogle = () => {
+    googleForThisJobRef.current = true;
+    handleResume();
+  };
+  const startTranslation = () => {
+    googleForThisJobRef.current = false;
     processBook();
   };
 
@@ -742,6 +777,7 @@ export default function App() {
   const handleCancelTranslation = () => {
     if (confirm('Çeviriyi iptal etmek istediğinizden emin misiniz? (Mevcut bölüm çevirisi durdurulacak)')) {
       clearTimeout(resumeTimerRef.current);
+      setQuotaResumeAt(null);
       pauseRef.current = true;
       setStep(2);
       // Reset statuses of processing chapters back to pending
@@ -1652,7 +1688,7 @@ export default function App() {
 
                 <div className={`pt-6 mt-4 border-t ${isDarkMode ? 'border-slate-700' : 'border-slate-100'}`}>
                   <button 
-                    onClick={processBook}
+                    onClick={startTranslation}
                     disabled={chapters.filter(c => c.selected).length === 0}
                     className={`w-full font-bold py-4 px-4 rounded-2xl transition-all shadow-sm hover:shadow flex items-center justify-center gap-2 text-lg disabled:cursor-not-allowed ${isDarkMode ? 'bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 disabled:border disabled:border-slate-700 text-white' : 'bg-blue-600 hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-400 text-white'}`}
                   >
@@ -1693,16 +1729,34 @@ export default function App() {
                   </div>
                   
                   <h2 className={`text-xl font-bold mb-2 tracking-tight ${isDarkMode ? 'text-slate-100' : 'text-slate-900'}`}>
-                    {isPaused ? 'Durduruldu' : 'Çevriliyor...'}
+                    {isPaused ? (quotaResumeAt ? 'Kota bekleniyor' : 'Durduruldu') : 'Çevriliyor...'}
                   </h2>
-                  <p className={`mb-6 text-sm truncate px-4 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-                    {isPaused ? 'Devam etmek için Başlat\'a tıklayın.' : progress.chapterTitle}
-                  </p>
+                  {isPaused && quotaResumeAt ? (
+                    <p className={`mb-6 text-sm px-2 leading-relaxed ${isDarkMode ? 'text-slate-300' : 'text-slate-600'}`}>
+                      Bütün yapay zeka kotaları doldu. Kota <strong>{new Date(quotaResumeAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</strong> civarında
+                      ({formatWait(quotaResumeAt - now)} sonra) yenilenince çeviri kaldığı yerden kendiliğinden devam edecek. Uygulama açık kalmalı;
+                      çevrilen paragraflar kaybolmaz.
+                    </p>
+                  ) : (
+                    <p className={`mb-6 text-sm truncate px-4 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                      {isPaused ? 'Devam etmek için Başlat\'a tıklayın.' : progress.chapterTitle}
+                    </p>
+                  )}
                   
                   <div className="flex flex-col gap-3 max-w-xs mx-auto">
+                    {isPaused && quotaResumeAt && (
+                      <>
+                        <button onClick={continueWithGoogle} className="w-full flex items-center justify-center gap-2 bg-amber-500 text-white px-4 py-3 rounded-xl font-bold hover:bg-amber-600 transition-all shadow-sm">
+                          <Globe className="w-4 h-4" /> Google Translate ile şimdi devam et
+                        </button>
+                        <p className={`-mt-1 text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                          Kalan paragraflar bağlamsız, daha düşük kalitede çevrilir. Yalnızca bu kitap için geçerli.
+                        </p>
+                      </>
+                    )}
                     {isPaused ? (
                       <button onClick={handleResume} className="w-full flex items-center justify-center gap-2 bg-blue-600 text-white px-4 py-3 rounded-xl font-bold hover:bg-blue-700 transition-all shadow-sm">
-                        <Play className="w-4 h-4" fill="currentColor" /> Başlat
+                        <Play className="w-4 h-4" fill="currentColor" /> {quotaResumeAt ? 'Şimdi tekrar dene' : 'Başlat'}
                       </button>
                     ) : (
                       <button onClick={handlePause} className={`w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl font-bold transition-all ${isDarkMode ? 'bg-slate-700 text-slate-300 hover:bg-slate-600' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>
