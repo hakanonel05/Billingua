@@ -145,8 +145,11 @@ const wantsNoReasoning = (s: LlmSettings) =>
 const MAX_BUSY_RETRIES = 4;
 const MAX_RETRY_WAIT_MS = 65_000;
 // A request that hasn't answered after this long is given up on, so a stalled connection can't
-// freeze a book (local models on a slow computer may need minutes for a batch).
+// freeze a book. A local model running on the processor alone (no graphics card) can need many
+// minutes for one batch, so local servers get far longer than cloud services.
 const REQUEST_TIMEOUT_MS = 5 * 60_000;
+const LOCAL_REQUEST_TIMEOUT_MS = 30 * 60_000;
+const isLocal = (s: LlmSettings) => /\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/.test(s.llmBaseUrl);
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 // What the AI client is doing right now, for the progress screen: waiting for an answer, or
@@ -233,7 +236,8 @@ export async function chat(
   let res: Response;
   try {
     for (let attempt = 0; ; attempt++) {
-      const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+      const timeoutMs = isLocal(s) ? LOCAL_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
+      const timeout = AbortSignal.timeout(timeoutMs);
       try {
         report({ kind: 'request', model, since: Date.now() });
         res = await fetch(endpoint(s, '/chat/completions'), {
@@ -244,7 +248,7 @@ export async function chat(
         if (signal?.aborted) throw e;
         if (timeout.aborted) {
           // Not fatal: the batch keeps its Google draft and the book goes on.
-          throw new LlmError(`${model} ${Math.round(REQUEST_TIMEOUT_MS / 60_000)} dakika içinde yanıt vermedi.`, 408);
+          throw new LlmError(`${model} ${Math.round(timeoutMs / 60_000)} dakika içinde yanıt vermedi.`, 408);
         }
         throw new LlmError(describeNetworkError(s), 0);
       }
