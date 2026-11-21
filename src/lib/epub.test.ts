@@ -3,8 +3,7 @@ import { describe, it, expect } from 'vitest';
 import JSZip from 'jszip';
 import {
   resolveZipPath, parseChapterDoc, getTranslatableBlocks, highlightTerms, escapeXml, stripPreviousTranslation, baseBookName,
-  relativeHref, updatePackageMetadata, addSpineItem, addToTableOfContents, buildGlossaryXhtml,
-} from './epub';
+  relativeHref, updatePackageMetadata, addSpineItem, addToTableOfContents, buildGlossaryXhtml, isFrontMatter } from './epub';
 import type { GlossaryTerm } from '../types';
 
 const xhtml = (body: string) =>
@@ -239,5 +238,19 @@ describe('package document', () => {
     expect(ncx).toContain('src="glossary.html"');
     expect(ncx).toContain('playOrder="2"');
     expect(ncx.match(/id="auto-glossary"/g)).toHaveLength(1);
+  });
+});
+
+describe('isFrontMatter', () => {
+  it('recognizes copyright and contents pages, by title or by their boilerplate', () => {
+    expect(isFrontMatter('Copyright Page', '')).toBe(true);
+    expect(isFrontMatter('Table of Contents', '')).toBe(true);
+    expect(isFrontMatter('Acknowledgments', '')).toBe(true);
+    expect(isFrontMatter('Chapter (id5)', 'Copyright © 2020. All rights reserved. ISBN 978-0-00-000000-0')).toBe(true);
+  });
+
+  it('leaves story chapters alone', () => {
+    expect(isFrontMatter('Chapter 1: Loomings', 'Call me Ishmael.')).toBe(false);
+    expect(isFrontMatter('Contentment', 'She was happy.')).toBe(false);
   });
 });

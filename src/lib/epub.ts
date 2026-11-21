@@ -46,6 +46,14 @@ export const getTranslatableBlocks = (doc: Document): Element[] =>
   Array.from(doc.querySelectorAll(BLOCK_SELECTOR))
     .filter(el => !el.parentElement?.closest(BLOCK_SELECTOR) && !el.closest('nav'));
 
+// Pages that are not part of the story (copyright, contents, acknowledgements...): rewriting
+// them for learners only spends AI requests. Recognized by the chapter title, or by the legal
+// boilerplate of a short page.
+const FRONT_MATTER_TITLE = /^(?:copyright|(?:table of )?contents|acknowledge?ments?|dedication|title page|half title|also by|other books|books by|about the (?:author|authors|publisher|book)|index|cover|colophon|imprint|praise for|newsletter|sign up)\b/i;
+export const isFrontMatter = (title: string, text: string): boolean =>
+  FRONT_MATTER_TITLE.test(title.trim())
+  || (text.length < 4000 && /all rights reserved|\bISBN\b/i.test(text));
+
 // Wraps glossary terms found in the text nodes of `root` in highlight spans. Works on the DOM
 // (never on serialized HTML) so markup and attributes can't be matched. Returns the terms found.
 export const highlightTerms = (root: Element, terms: GlossaryTerm[], field: 'source' | 'target'): Set<GlossaryTerm> => {

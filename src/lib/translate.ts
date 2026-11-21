@@ -226,8 +226,30 @@ const SIMPLIFY_GUIDE: Record<Exclude<SimplifyLevel, 'off'>, string> = {
 const simplifyNamespace = (config: AppConfig, level: SimplifyLevel) =>
   `simplify:${level}:${hash(config.llmBaseUrl.trim())}:${config.llmModel.trim()}`;
 
+// Rewrites from earlier runs, by any of the services (id -> rewrite).
+export async function cachedSimplifications(
+  texts: TranslationPayload[],
+  config: AppConfig,
+  level: SimplifyLevel,
+): Promise<Map<number, string>> {
+  const results = new Map<number, string>();
+  let pending = texts;
+  for (const service of llmCandidates(config)) {
+    if (pending.length === 0) break;
+    const ns = simplifyNamespace(service, level);
+    const hits = await getCachedTranslations(pending.map(t => `${ns}|${t.text}`));
+    pending = pending.filter((t, i) => {
+      if (hits[i]) results.set(t.id, hits[i]!);
+      return !hits[i];
+    });
+  }
+  return results;
+}
+
 // Rewrites English paragraphs at a lower CEFR level with the AI engine. Returns rewrites only for
 // paragraphs that were rewritten; the rest stay as they are. Fatal model errors are thrown.
+// Paragraphs go out in requests of the service's batch size, each request's results are cached as
+// they arrive, so a quota running out half-way keeps what was done.
 export async function simplifyBatch(
   texts: TranslationPayload[],
   config: AppConfig,
@@ -239,43 +261,45 @@ export async function simplifyBatch(
   if (llmCandidates(config).length === 0) throw new Error('Metni sadeleştirmek için bir yapay zeka sunucusu ve model seçin.');
 
   // Earlier rewrites by any of the services.
-  let pending = texts;
-  for (const service of llmCandidates(config)) {
-    const ns = simplifyNamespace(service, level);
-    const hits = await getCachedTranslations(pending.map(t => `${ns}|${t.text}`));
-    pending = pending.filter((t, i) => {
-      if (hits[i]) results.set(t.id, hits[i]!);
-      return !hits[i];
-    });
-  }
+  (await cachedSimplifications(texts, config, level)).forEach((text, id) => results.set(id, text));
+  const pending = texts.filter(t => !results.has(t.id));
   if (pending.length === 0) return results;
 
   let instruction = `You rewrite fiction and non-fiction for English learners at CEFR level ${level}. Rewrite the text in simpler English. ${SIMPLIFY_GUIDE[level]} Keep every event, fact, line of dialogue and name, in the same order; do not summarize, shorten the story or add anything. Keep quotation marks around dialogue.`;
   if (context.book?.title) instruction += ` The text comes from "${context.book.title}"${context.book.author ? ` by ${context.book.author}` : ''}.`;
   if (context.bookLevel) instruction += ` The original is written at about level ${context.bookLevel}.`;
   if (context.names?.length) instruction += ` Keep these names exactly as written: ${context.names.join(', ')}.`;
-  // The words a frequency analysis rates above the level: the ones most worth replacing.
+  // The words a frequency analysis rates above the level in a batch: the ones most worth replacing.
   const table = await loadRankTable();
-  const hardWords = [...new Set(pending.flatMap(t => textDifficulty(t.text, level, table).hardWords))]
-    .filter(w => !context.names?.some(n => n.toLowerCase() === w))
-    .slice(0, 60);
-  if (hardWords.length) {
-    instruction += ` These words in the texts are probably above ${level}: ${hardWords.join(', ')}. Replace them with common words, or explain them briefly in simple words when there is no simple equivalent.`;
-  }
+  const instructionFor = (batch: TranslationPayload[]) => {
+    const hardWords = [...new Set(batch.flatMap(t => textDifficulty(t.text, level, table).hardWords))]
+      .filter(w => !context.names?.some(n => n.toLowerCase() === w))
+      .slice(0, 60);
+    return hardWords.length
+      ? `${instruction} These words in the texts are probably above ${level}: ${hardWords.join(', ')}. Replace them with common words, or explain them briefly in simple words when there is no simple equivalent.`
+      : instruction;
+  };
 
   let lastError: unknown;
   const done = await withLlmFallback(config, {
     ...context,
     onLlmError: (err, next) => { lastError = err; context.onLlmError?.(err, next); },
   }, async service => {
-    const rewritten = await mapParagraphs(service, instruction, pending, context.precedingText);
+    // Each service starts from what the previous ones left undone, in its own batch size.
+    const remaining = pending.filter(t => !results.has(t.id));
     const ns = simplifyNamespace(service, level);
-    const fresh: [string, string][] = [];
-    rewritten.forEach((text, id) => {
-      results.set(id, text);
-      fresh.push([`${ns}|${pending.find(t => t.id === id)!.text}`, text]);
-    });
-    await setCachedTranslations(fresh);
+    const size = batchSizeOf(service);
+    for (let start = 0; start < remaining.length; start += size) {
+      const batch = remaining.slice(start, start + size);
+      const preceding = start === 0 ? context.precedingText : remaining.slice(Math.max(0, start - 3), start).map(t => t.text);
+      const rewritten = await mapParagraphs(service, instructionFor(batch), batch, preceding);
+      const fresh: [string, string][] = [];
+      rewritten.forEach((text, id) => {
+        results.set(id, text);
+        fresh.push([`${ns}|${batch.find(t => t.id === id)!.text}`, text]);
+      });
+      await setCachedTranslations(fresh);
+    }
     return true;
   });
   // Simplifying has no Google fallback: when every AI service is out of quota, pause until the
