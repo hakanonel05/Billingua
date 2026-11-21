@@ -3,13 +3,13 @@ import JSZip from 'jszip';
 import { del, keys } from 'idb-keyval';
 import { BookOpen, UploadCloud, Download, Loader2, CheckCircle, Layout, FileText, AlertCircle, Settings, Play, Pause, Book, Type as TypeIcon, Globe, ArrowLeft, RotateCcw, Library, Moon, Sun, Trash2, Volume2, Square, Zap, Shield, ArrowRight, Layers, X, Info, Gauge, ChevronRight, ChevronDown, Check } from 'lucide-react';
 import { saveBookToLibrary, getLibraryBooks, deleteBookFromLibrary, SavedBook, loadSettings, saveSettings, savePendingJob, loadPendingJob, clearPendingJob, clearTranslationCache, PendingJob } from './lib/db';
-import { analyzeCEFR, getComprehensionPercentage, wordsToLearn, loadRankTable, frequentNames, levelOf, levelIndex, CEFRLevelStats } from './lib/cefr';
+import { analyzeCEFR, getComprehensionPercentage, wordsToLearn, loadRankTable, frequentNames, levelOf, levelIndex, needsSimplifying, CEFRLevelStats } from './lib/cefr';
 import { XHTML_NS, resolveZipPath, loadChapterDoc, baseBookName, getTranslatableBlocks, highlightTerms, createSampleEpub, createPair, markLanguage, PAIR_CSS, buildGlossaryXhtml, updatePackageMetadata, addSpineItem, addToTableOfContents } from './lib/epub';
 import { translateBatch, simplifyBatch, llmCandidates, hasUsableLlm, QuotaWaitError } from './lib/translate';
 import { epubToPdf, pdfSupportsLanguage } from './lib/pdf';
 import { IDIOMS, LANGUAGES } from './constants';
 import type { LayoutType, EngineType, Chapter, AppConfig, GlossaryTerm, SimplifyLevel } from './types';
-import { LLM_PRESETS, listModels, isFatal, batchSizeOf } from './lib/llm';
+import { LLM_PRESETS, listModels, isFatal, batchSizeOf, onLlmActivity, type LlmActivity } from './lib/llm';
 
 const storedSettings = loadSettings();
 
@@ -32,7 +32,13 @@ const formatWait = (ms: number) => {
 const BATCH_SIZE = 10;        // paragraphs per translation request
 const PARALLEL_BATCHES = 3;   // requests in flight at once
 const CONTEXT_PARAGRAPHS = 3; // preceding paragraphs sent to the AI model as context
-const SIMPLIFY_MIN_WORDS = 6; // shorter lines are left as they are when simplifying
+const SIMPLIFY_MIN_WORDS = 4; // shorter lines are left as they are when simplifying
+
+// "1:05"
+const formatClock = (ms: number) => {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+};
 
 // --- Main App Component ---
 export default function App() {
@@ -57,6 +63,8 @@ export default function App() {
     llmApiKey: '',
     llmKeys: {},
     simplifyLevel: 'off',
+    outputMode: 'bilingual',
+    simpleEnglishLevel: 'B1',
     whenQuotaRunsOut: 'wait',
     buildGlossary: true,
     customBg: '#f8f9fa',
@@ -72,7 +80,9 @@ export default function App() {
     ...storedConfig(),
   }));
   
-  const [progress, setProgress] = useState({ current: 0, total: 0, chapterTitle: '' });
+  // `paragraphs`: how far the current chapter is, so the percentage moves within a long chapter
+  // instead of only when a whole chapter is done.
+  const [progress, setProgress] = useState({ current: 0, total: 0, chapterTitle: '', paragraphs: { done: 0, total: 0 } });
   const [isPaused, setIsPaused] = useState(false);
   const pauseRef = useRef(false);
   
@@ -104,7 +114,29 @@ export default function App() {
   }, [quotaResumeAt]);
   const [llmModels, setLlmModels] = useState<string[]>([]);
   const [llmStatus, setLlmStatus] = useState<{ kind: 'idle' | 'loading' | 'ok' | 'error'; message?: string }>({ kind: 'idle' });
-  const needsLlm = config.engine !== 'gtx' || config.simplifyLevel !== 'off';
+  const englishOnly = config.outputMode === 'simple-english';
+  // The level the English is rewritten to in the current mode ('off': not rewritten).
+  const effectiveSimplifyLevel: SimplifyLevel = englishOnly ? config.simpleEnglishLevel : config.simplifyLevel;
+  const needsLlm = englishOnly || config.engine !== 'gtx' || config.simplifyLevel !== 'off';
+
+  // What the AI client is doing (waiting for an answer, or out a per-minute limit), shown under
+  // the progress ring so a slow request doesn't look like a hang. Ticks every second meanwhile.
+  const [llmActivity, setLlmActivity] = useState<LlmActivity>({ kind: 'idle' });
+  const [clock, setClock] = useState(() => Date.now());
+  useEffect(() => {
+    onLlmActivity(setLlmActivity);
+    return () => onLlmActivity(null);
+  }, []);
+  useEffect(() => {
+    if (llmActivity.kind === 'idle') return;
+    setClock(Date.now());
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [llmActivity]);
+  const progressPercent = progress.total
+    ? Math.min(100, Math.max(0, (Math.max(0, progress.current - 1)
+        + (progress.paragraphs.total ? progress.paragraphs.done / progress.paragraphs.total : 0)) / progress.total * 100))
+    : 0;
 
   // Told when an AI service fails for good (each service at most once per run, it is then skipped).
   const reportLlmError = (err: Error, nextService?: string) => {
@@ -211,7 +243,7 @@ export default function App() {
     setZipInstance(null);
     setOpfPath('');
     setChapters([]);
-    setProgress({ current: 0, total: 0, chapterTitle: '' });
+    setProgress({ current: 0, total: 0, chapterTitle: '', paragraphs: { done: 0, total: 0 } });
     setIsPaused(false);
     pauseRef.current = false;
     setPreviews({});
@@ -381,15 +413,16 @@ export default function App() {
   const processBook = async () => {
     if (!zipInstance) return;
     const llmReady = llmCandidates(config).length > 0; // selected service or a saved backup
+    const simplifyLevel = effectiveSimplifyLevel;
     // Simplifying needs the model; translating does not, Google Translate takes over.
-    if (config.simplifyLevel !== 'off' && !llmReady) {
+    if (simplifyLevel !== 'off' && !llmReady) {
       setErrorMsg('Metni sadeleştirmek için yapay zeka gerekli. Ayarlardaki "Açık Kaynak Yapay Zeka" bölümünde bir servis seçip anahtarını girin.');
       return;
     }
     setStep(3);
     setIsPaused(false);
     pauseRef.current = false;
-    setErrorMsg(config.engine !== 'gtx' && !llmReady
+    setErrorMsg(!englishOnly && config.engine !== 'gtx' && !llmReady
       ? 'Yapay zeka için anahtar ya da model girilmedi; çeviri Google Translate ile yapılıyor.'
       : '');
     
@@ -404,9 +437,10 @@ export default function App() {
     }
     const rankTable = await loadRankTable();
 
-    // Phase 1: Build Glossary before translating chapters
+    // Phase 1: Build Glossary before translating chapters (a bilingual book only: the glossary
+    // pairs words with their translations)
     glossaryTermsRef.current = [];
-    if (config.buildGlossary) {
+    if (config.buildGlossary && !englishOnly) {
       setProgress(p => ({ ...p, current: 0, chapterTitle: 'Analyzing text for glossary...' }));
       const counts = new Map<string, { count: number, type: 'word'|'idiom' }>();
       
@@ -568,7 +602,7 @@ export default function App() {
       if (!chapter.selected || chapter.status === 'done') continue;
 
       setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'processing' } : c));
-      setProgress(p => ({ ...p, current: processedCount + 1, chapterTitle: chapter.title }));
+      setProgress(p => ({ ...p, current: processedCount + 1, chapterTitle: chapter.title, paragraphs: { done: 0, total: 0 } }));
 
       try {
         const content = await zipInstance.file(chapter.fullPath)?.async("text");
@@ -587,9 +621,10 @@ export default function App() {
         // Results are applied in document order either way.
         // AI batches are as large as the selected service allows (Gemini: 50 paragraphs per request,
         // since its free quota counts requests), so a book needs few requests.
-        const sequential = config.engine === 'llm' && hasUsableLlm(config);
+        const sequential = (config.engine === 'llm' || englishOnly) && hasUsableLlm(config);
         const batchSize = sequential ? batchSizeOf(config) : BATCH_SIZE;
         const waveSpan = batchSize * (sequential ? 1 : PARALLEL_BATCHES);
+        setProgress(p => ({ ...p, paragraphs: { done: 0, total: elements.length } }));
         for (let start = 0; start < elements.length; start += waveSpan) {
           if (pauseRef.current) break;
           const wave: number[] = [];
@@ -611,14 +646,20 @@ export default function App() {
               previousPairs,
               names: bookNamesRef.current,
               book: bookInfoRef.current,
+              bookLevel: cefrStats?.estimatedLevel,
               onLlmError: reportLlmError,
             };
-            // Graded-reader mode: rewrite the English first (not headings or very short lines),
-            // then translate the rewritten text so both columns say the same thing.
-            const simplified = await simplifyBatch(
-              payload.filter(p => !/^h[1-6]$/.test(elements[p.id].localName) && p.text.split(' ').length >= SIMPLIFY_MIN_WORDS),
-              config, config.simplifyLevel, context,
+            // Graded-reader mode: rewrite the English first, then translate the rewritten text so
+            // both columns say the same thing. Only paragraphs the analysis rates above the level
+            // (rare words, long sentences) are rewritten; headings and very short lines never are.
+            const simplified = simplifyLevel === 'off' ? new Map<number, string>() : await simplifyBatch(
+              payload.filter(p => !/^h[1-6]$/.test(elements[p.id].localName)
+                && p.text.split(' ').length >= SIMPLIFY_MIN_WORDS
+                && needsSimplifying(p.text, simplifyLevel, rankTable)),
+              config, simplifyLevel, context,
             );
+            // English-only book: the simplified English is the whole result, nothing is translated.
+            if (englishOnly) return { translations: [], simplified };
             payload = payload.map(p => ({ id: p.id, text: simplified.get(p.id) ?? p.text }));
             const jobConfig = googleForThisJobRef.current ? { ...config, whenQuotaRunsOut: 'google' as const } : config;
             return { translations: await translateBatch(payload, jobConfig, pauseRef, context), simplified };
@@ -635,6 +676,8 @@ export default function App() {
               applyTranslation(htmlDoc, elements[t.id], t.translation);
             });
           }
+
+          setProgress(p => ({ ...p, paragraphs: { done: Math.min(start + waveSpan, elements.length), total: elements.length } }));
 
           // --- LIVE PREVIEW UPDATE ---
           setPreviews(prev => ({ ...prev, [chapter.id]: previewHtml(htmlDoc) }));
@@ -673,7 +716,7 @@ export default function App() {
           break;
         }
         console.error(`Failed to process chapter ${chapter.title}`, err);
-        if (isFatal(err) || (config.simplifyLevel !== 'off' && !hasUsableLlm(config))) {
+        if (isFatal(err) || (simplifyLevel !== 'off' && !hasUsableLlm(config))) {
           // The model is unreachable: pause so the settings can be fixed and the job resumed.
           setErrorMsg(`Sadeleştirme durdu: ${(err as Error).message}`);
           setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'pending' } : c));
@@ -708,7 +751,9 @@ export default function App() {
       const opfContent = await zipInstance.file(opfPath)?.async("text");
       if (opfContent) {
         const opfDoc = new DOMParser().parseFromString(opfContent, "application/xml");
-        updatePackageMetadata(opfDoc, { sourceLang: config.sourceLang, targetLang: config.targetLang, layout: config.layout, simplifyLevel: config.simplifyLevel });
+        updatePackageMetadata(opfDoc, englishOnly
+          ? { sourceLang: 'en', targetLang: 'en', layout: 'replace', simplifyLevel: effectiveSimplifyLevel }
+          : { sourceLang: config.sourceLang, targetLang: config.targetLang, layout: config.layout, simplifyLevel: config.simplifyLevel });
         if (hasGlossary) {
           addSpineItem(opfDoc, 'auto-glossary', 'glossary.html');
           await addToTableOfContents(zipInstance, opfPath, opfDoc, glossaryPath, 'Sözlük / Glossary', 'auto-glossary');
@@ -726,11 +771,11 @@ export default function App() {
     const bookTitle = file ? baseBookName(file.name) : 'Translated_Book';
     const savedBook: SavedBook = {
       id: Date.now().toString(),
-      title: `${bookTitle}_${config.targetLang.toUpperCase()}.epub`,
+      title: englishOnly ? `${bookTitle}_EN_${effectiveSimplifyLevel}.epub` : `${bookTitle}_${config.targetLang.toUpperCase()}.epub`,
       date: Date.now(),
       blob: blob,
-      sourceLang: config.sourceLang,
-      targetLang: config.targetLang
+      sourceLang: englishOnly ? 'en' : config.sourceLang,
+      targetLang: englishOnly ? 'en' : config.targetLang
     };
     await saveBookToLibrary(savedBook);
     await clearPendingJob();
@@ -787,7 +832,9 @@ export default function App() {
     }
   };
 
-  const outputName = () => `${file ? baseBookName(file.name) : 'Book'}_Bilingual_${config.targetLang}.epub`;
+  const outputName = () => englishOnly
+    ? `${file ? baseBookName(file.name) : 'Book'}_Simple_English_${effectiveSimplifyLevel}.epub`
+    : `${file ? baseBookName(file.name) : 'Book'}_Bilingual_${config.targetLang}.epub`;
 
   const downloadEpub = () => {
     if (!finalBlob || !file) return;
@@ -1248,6 +1295,75 @@ export default function App() {
                 )}
                 
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                  <div className="md:col-span-2 space-y-3">
+                    <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Ne yapmak istiyorsunuz?</label>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      {([
+                        { id: 'bilingual', name: 'İki dilli kitap', desc: 'İngilizce metin ve çevirisi (yan yana, satır arası ya da sadece çeviri)', icon: Layout },
+                        { id: 'simple-english', name: 'Sadece sade İngilizce', desc: 'Çeviri yok: kitap B1 ya da B2 seviyesinde yeniden yazılır, yalnızca İngilizce okursunuz', icon: BookOpen },
+                      ] as const).map(m => {
+                        const active = config.outputMode === m.id;
+                        return (
+                          <button
+                            key={m.id}
+                            onClick={() => setConfig(c => ({
+                              ...c,
+                              outputMode: m.id,
+                              // First switch to English-only: start from the level that suits the reader.
+                              ...(m.id === 'simple-english' && c.outputMode !== m.id ? { simpleEnglishLevel: levelIndex(userLevel) <= levelIndex('B1') ? 'B1' as const : 'B2' as const } : {}),
+                            }))}
+                            className={`flex items-start text-left gap-3 p-5 rounded-2xl border-2 transition-all ${active ? (isDarkMode ? 'border-blue-500 bg-blue-900/30 shadow-sm' : 'border-blue-600 bg-blue-50/50 shadow-sm') : isDarkMode ? 'border-slate-700 bg-slate-900 hover:border-slate-600' : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50'}`}
+                          >
+                            <div className={`p-2 rounded-lg shrink-0 ${active ? 'bg-blue-600 text-white' : isDarkMode ? 'bg-slate-800 text-slate-400' : 'bg-slate-100 text-slate-600'}`}>
+                              <m.icon className="w-5 h-5" />
+                            </div>
+                            <div>
+                              <div className={`font-semibold ${active ? (isDarkMode ? 'text-blue-300' : 'text-blue-900') : isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>{m.name}</div>
+                              <div className={`text-xs mt-1 ${active ? (isDarkMode ? 'text-blue-400/70' : 'text-blue-700/70') : 'text-slate-500'}`}>{m.desc}</div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {englishOnly && (
+                    <div className={`md:col-span-2 p-5 rounded-2xl border space-y-4 animate-fade-in ${isDarkMode ? 'bg-slate-900 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
+                      <div>
+                        <h4 className={`text-sm font-semibold ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>Hedef seviye</h4>
+                        <p className={`text-xs mt-1 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                          {cefrStats
+                            ? <>Analize göre kitabın rahat okuma seviyesi <strong>{cefrStats.estimatedLevel}</strong>. Her paragraf ayrıca incelenir: seçtiğiniz seviyenin üstünde kelime ya da çok uzun cümle içeren paragraflar yapay zekayla yeniden yazılır, zaten yeterince sade olanlar olduğu gibi kalır.</>
+                            : 'Her paragraf incelenir: seçtiğiniz seviyenin üstündeki paragraflar yapay zekayla yeniden yazılır, zaten sade olanlar olduğu gibi kalır.'}
+                        </p>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        {(['B1', 'B2'] as const).map(level => {
+                          const active = config.simpleEnglishLevel === level;
+                          return (
+                            <button
+                              key={level}
+                              onClick={() => setConfig(c => ({ ...c, simpleEnglishLevel: level }))}
+                              className={`p-4 rounded-xl border-2 text-left transition-all ${active ? (isDarkMode ? 'border-blue-500 bg-blue-900/30' : 'border-blue-600 bg-white') : isDarkMode ? 'border-slate-700 hover:border-slate-600' : 'border-slate-200 bg-white hover:border-slate-300'}`}
+                            >
+                              <div className={`font-bold ${active ? (isDarkMode ? 'text-blue-300' : 'text-blue-700') : isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>{level}</div>
+                              <div className="text-xs mt-1 text-slate-500">
+                                {level === 'B1' ? 'Günlük kelimeler, kısa ve açık cümleler' : 'Doğal üslup korunur; nadir kelimeler ve çok uzun cümleler sadeleşir'}
+                                {cefrStats ? ` · orijinalin %${getComprehensionPercentage(cefrStats, level)}'i bu seviyede` : ''}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <p className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                        {cefrStats && levelIndex(cefrStats.estimatedLevel) <= levelIndex(config.simpleEnglishLevel)
+                          ? `Bu kitap zaten ${cefrStats.estimatedLevel} seviyesinde; yalnızca zor paragraflar değişir.`
+                          : `Seviyeniz (${userLevel}) için önerilen: ${levelIndex(userLevel) <= levelIndex('B1') ? 'B1' : 'B2'}. Çeviri yapılmaz, bu yüzden Google Translate de kullanılmaz; aşağıda bir yapay zeka servisi seçin.`}
+                      </p>
+                    </div>
+                  )}
+
+                  {!englishOnly && (<>
                   <div className="space-y-2">
                     <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Kaynak Dil</label>
                     <div className="relative">
@@ -1323,6 +1439,7 @@ export default function App() {
                           : `Sol sütunda orijinal yerine ${config.simplifyLevel} seviyesinde yeniden yazılmış İngilizce yer alır. Yerel bir modelde uzun bir kitap saatler sürebilir.`}
                     </p>
                   </div>
+                  </>)}
 
                   {needsLlm && (
                     <div className={`md:col-span-2 p-5 rounded-2xl border space-y-4 animate-fade-in ${isDarkMode ? 'bg-slate-900 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
@@ -1395,6 +1512,7 @@ export default function App() {
                       <p className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
                         {LLM_PRESETS.find(p => p.id === config.llmProvider)?.hint} Anahtar yalnızca bu tarayıcıda saklanır ve doğrudan seçtiğiniz sunucuya gönderilir.
                       </p>
+                      {!englishOnly && (
                       <div className="space-y-2">
                         <label className={`block text-xs font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Kotalar bitince</label>
                         <select
@@ -1409,11 +1527,13 @@ export default function App() {
                           Önce seçili model, sonra aynı servisin diğer modelleri, sonra anahtarını girdiğin diğer servisler denenir. Hepsinin kotası biterse bu seçenek geçerli olur.
                         </p>
                       </div>
+                      )}
                       {llmStatus.kind === 'ok' && <p className="text-xs font-medium text-emerald-600">{llmStatus.message}</p>}
                       {llmStatus.kind === 'error' && <p className="text-xs font-medium text-red-600">{llmStatus.message}</p>}
                     </div>
                   )}
 
+                  {!englishOnly && (<>
                   <div className="md:col-span-2 space-y-3">
                     <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Sayfa Düzeni</label>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1458,8 +1578,10 @@ export default function App() {
                       </div>
                     </div>
                   )}
+                  </>)}
 
                   {/* Advanced Translation Settings */}
+                  {!englishOnly && (
                   <div className={`md:col-span-2 p-6 rounded-2xl border shadow-sm ${isDarkMode ? 'bg-slate-900/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
                     <h3 className={`text-lg font-bold mb-4 ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>Gelişmiş Çeviri Ayarları</h3>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -1494,6 +1616,7 @@ export default function App() {
                       </div>
                     </div>
                   </div>
+                  )}
 
                   {/* Appearance Settings */}
                   <div className={`md:col-span-2 p-6 rounded-2xl border shadow-sm ${isDarkMode ? 'bg-slate-900/50 border-slate-700' : 'bg-slate-50 border-slate-200'}`}>
@@ -1555,6 +1678,7 @@ export default function App() {
                     </div>
                   </div>
 
+                  {!englishOnly && (
                   <div className={`md:col-span-2 p-6 rounded-2xl border shadow-sm ${isDarkMode ? 'bg-emerald-900/20 border-emerald-800/50' : 'bg-gradient-to-br from-emerald-50 to-teal-50 border-emerald-100'}`}>
                     <div className="flex items-start gap-3">
                       <div className="flex items-center h-6">
@@ -1653,6 +1777,7 @@ export default function App() {
                       </div>
                     )}
                   </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1693,7 +1818,7 @@ export default function App() {
                     className={`w-full font-bold py-4 px-4 rounded-2xl transition-all shadow-sm hover:shadow flex items-center justify-center gap-2 text-lg disabled:cursor-not-allowed ${isDarkMode ? 'bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-600 disabled:border disabled:border-slate-700 text-white' : 'bg-blue-600 hover:bg-blue-700 disabled:bg-slate-100 disabled:text-slate-400 text-white'}`}
                   >
                     <Play className="w-5 h-5" />
-                    Çeviriyi Başlat
+                    {englishOnly ? 'Sadeleştirmeyi Başlat' : 'Çeviriyi Başlat'}
                   </button>
                 </div>
               </div>
@@ -1714,13 +1839,13 @@ export default function App() {
                         cx="50" cy="50" r="45" fill="none" stroke="#2563eb" strokeWidth="6" 
                         strokeLinecap="round"
                         strokeDasharray={`${2 * Math.PI * 45}`} 
-                        strokeDashoffset={`${2 * Math.PI * 45 * (1 - progress.current / Math.max(1, progress.total))}`} 
+                        strokeDashoffset={`${2 * Math.PI * 45 * (1 - progressPercent / 100)}`} 
                         className="transition-all duration-700 ease-out"
                       />
                     </svg>
                     <div className="absolute inset-0 flex items-center justify-center flex-col">
                       <span className={`text-xl font-black tracking-tight ${isDarkMode ? 'text-blue-400' : 'text-blue-600'}`}>
-                        {Math.round((progress.current / Math.max(1, progress.total)) * 100)}<span className="text-sm">%</span>
+                        {Math.floor(progressPercent)}<span className="text-sm">%</span>
                       </span>
                     </div>
                     {!isPaused && (
@@ -1729,22 +1854,40 @@ export default function App() {
                   </div>
                   
                   <h2 className={`text-xl font-bold mb-2 tracking-tight ${isDarkMode ? 'text-slate-100' : 'text-slate-900'}`}>
-                    {isPaused ? (quotaResumeAt ? 'Kota bekleniyor' : 'Durduruldu') : 'Çevriliyor...'}
+                    {isPaused ? (quotaResumeAt ? 'Kota bekleniyor' : 'Durduruldu') : englishOnly ? 'Sadeleştiriliyor...' : 'Çevriliyor...'}
                   </h2>
                   {isPaused && quotaResumeAt ? (
                     <p className={`mb-6 text-sm px-2 leading-relaxed ${isDarkMode ? 'text-slate-300' : 'text-slate-600'}`}>
                       Bütün yapay zeka kotaları doldu. Kota <strong>{new Date(quotaResumeAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}</strong> civarında
-                      ({formatWait(quotaResumeAt - now)} sonra) yenilenince çeviri kaldığı yerden kendiliğinden devam edecek. Uygulama açık kalmalı;
-                      çevrilen paragraflar kaybolmaz.
+                      ({formatWait(quotaResumeAt - now)} sonra) yenilenince {englishOnly ? 'sadeleştirme' : 'çeviri'} kaldığı yerden kendiliğinden devam edecek. Uygulama açık kalmalı;
+                      biten paragraflar kaybolmaz.
                     </p>
                   ) : (
-                    <p className={`mb-6 text-sm truncate px-4 ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-                      {isPaused ? 'Devam etmek için Başlat\'a tıklayın.' : progress.chapterTitle}
-                    </p>
+                    <div className="mb-6 px-4 space-y-1">
+                      <p className={`text-sm truncate ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                        {isPaused ? 'Devam etmek için Başlat\'a tıklayın.' : progress.chapterTitle}
+                      </p>
+                      {!isPaused && progress.total > 0 && progress.current > 0 && (
+                        <p className={`text-xs ${isDarkMode ? 'text-slate-500' : 'text-slate-400'}`}>
+                          Bölüm {Math.min(progress.current, progress.total)}/{progress.total}
+                          {progress.paragraphs.total > 0 && ` · paragraf ${progress.paragraphs.done}/${progress.paragraphs.total}`}
+                        </p>
+                      )}
+                      {!isPaused && llmActivity.kind === 'request' && clock - llmActivity.since > 5_000 && (
+                        <p className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+                          Yapay zekanın yanıtı bekleniyor ({llmActivity.model}) · {formatClock(clock - llmActivity.since)}
+                        </p>
+                      )}
+                      {!isPaused && llmActivity.kind === 'rate-limit' && (
+                        <p className="text-xs text-amber-600 dark:text-amber-400">
+                          {llmActivity.model} dakikalık istek sınırına ulaştı; {formatClock(llmActivity.until - clock)} sonra devam edecek. Bu bir kota bitişi değil, normaldir.
+                        </p>
+                      )}
+                    </div>
                   )}
                   
                   <div className="flex flex-col gap-3 max-w-xs mx-auto">
-                    {isPaused && quotaResumeAt && (
+                    {isPaused && quotaResumeAt && effectiveSimplifyLevel === 'off' && (
                       <>
                         <button onClick={continueWithGoogle} className="w-full flex items-center justify-center gap-2 bg-amber-500 text-white px-4 py-3 rounded-xl font-bold hover:bg-amber-600 transition-all shadow-sm">
                           <Globe className="w-4 h-4" /> Google Translate ile şimdi devam et
@@ -1768,7 +1911,7 @@ export default function App() {
                       onClick={handleCancelTranslation} 
                       className={`w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl font-bold transition-all border ${isDarkMode ? 'border-red-900/30 text-red-400 hover:bg-red-900/20' : 'border-red-100 text-red-600 hover:bg-red-50'}`}
                     >
-                      <X className="w-4 h-4" /> Çeviriyi İptal Et
+                      <X className="w-4 h-4" /> {englishOnly ? 'İptal Et' : 'Çeviriyi İptal Et'}
                     </button>
                   </div>
                 </div>
@@ -1781,7 +1924,7 @@ export default function App() {
                     <CheckCircle className="w-8 h-8 text-white" />
                   </div>
                   <h2 className="text-2xl font-bold mb-2 relative z-10">Tebrikler!</h2>
-                  <p className={`text-sm mb-8 relative z-10 ${isDarkMode ? 'text-blue-200' : 'text-blue-100'}`}>İki dilli kitabınız hazır.</p>
+                  <p className={`text-sm mb-8 relative z-10 ${isDarkMode ? 'text-blue-200' : 'text-blue-100'}`}>{englishOnly ? `${effectiveSimplifyLevel} seviyesinde sade İngilizce kitabınız hazır.` : 'İki dilli kitabınız hazır.'}</p>
                   <button 
                     onClick={downloadEpub}
                     className={`w-full flex items-center justify-center gap-2 px-4 py-3.5 rounded-xl font-bold transition-all shadow-sm relative z-10 ${isDarkMode ? 'bg-slate-800 text-blue-300 hover:bg-slate-700' : 'bg-white text-blue-700 hover:bg-blue-50'}`}
@@ -1797,7 +1940,7 @@ export default function App() {
                     {pdfBusy === 'current' ? <Loader2 className="w-5 h-5 animate-spin" /> : <FileText className="w-5 h-5" />}
                     {pdfBusy === 'current' ? 'PDF hazırlanıyor...' : 'PDF Olarak İndir'}
                   </button>
-                  {!pdfSupportsLanguage(config.targetLang) && (
+                  {!englishOnly && !pdfSupportsLanguage(config.targetLang) && (
                     <p className={`text-xs mt-2 relative z-10 ${isDarkMode ? 'text-blue-200' : 'text-blue-100'}`}>PDF yazı tipi bu dilin alfabesini içermiyor; bu dil için EPUB kullanın.</p>
                   )}
                   <button 
@@ -1805,7 +1948,7 @@ export default function App() {
                     className={`w-full flex items-center justify-center gap-2 px-4 py-3.5 rounded-xl font-bold transition-all mt-3 relative z-10 ${isDarkMode ? 'bg-blue-800/50 text-blue-200 hover:bg-blue-700/50' : 'bg-blue-700/30 text-white hover:bg-blue-700/50'}`}
                   >
                     <RotateCcw className="w-5 h-5" />
-                    Başka Bir Kitap Çevir
+                    {englishOnly ? 'Başka Bir Kitap Seç' : 'Başka Bir Kitap Çevir'}
                   </button>
                 </div>
               )}

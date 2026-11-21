@@ -236,3 +236,49 @@ export function wordsToLearn(stats: CEFRLevelStats, userLevel: string, limit = 2
   const userIdx = levelIndex(userLevel);
   return stats.words.filter(w => levelIndex(w.level) > userIdx).slice(0, limit);
 }
+
+// --- Paragraph difficulty (graded-reader rewriting) ---
+
+// Longest sentence (in words) a reader at the level follows without effort.
+const SENTENCE_LIMIT: Partial<Record<CEFRLevel, number>> = { A2: 15, B1: 22, B2: 32 };
+// Share of words above the level a paragraph may have and still read comfortably.
+const HARD_WORD_SHARE = 0.02;
+
+export interface TextDifficulty {
+  words: number;
+  // Distinct lowercase words above the level, in order of appearance.
+  hardWords: string[];
+  hardCount: number;
+  longestSentence: number;
+}
+
+// How a paragraph reads for someone at `level`. Capitalized words are skipped (names, and
+// sentence-initial words, which are nearly always common), as are contractions and possessives.
+export function textDifficulty(text: string, level: string, table: RankTable): TextDifficulty {
+  const target = levelIndex(level);
+  const normalized = normalizeApostrophes(text);
+  const hard = new Set<string>();
+  let words = 0;
+  let hardCount = 0;
+  for (const m of normalized.matchAll(WORD_RE)) {
+    words++;
+    const w = m[0];
+    if (!/^[a-z]/.test(w) || w.includes("'")) continue;
+    if (levelIndex(levelOf(w, table)) > target) {
+      hardCount++;
+      hard.add(w);
+    }
+  }
+  const longestSentence = Math.max(0, ...normalized
+    .split(/[.!?;:…]+["'”’)]*\s+|\n+/)
+    .map(sentence => (sentence.match(WORD_RE) || []).length));
+  return { words, hardWords: [...hard], hardCount, longestSentence };
+}
+
+// Whether a paragraph is above `level` and worth rewriting: rare words or long sentences.
+export function needsSimplifying(text: string, level: string, table: RankTable): boolean {
+  const d = textDifficulty(text, level, table);
+  if (d.words === 0) return false;
+  const limit = SENTENCE_LIMIT[level as CEFRLevel] ?? Infinity;
+  return d.hardCount / d.words > HARD_WORD_SHARE || d.longestSentence > limit;
+}
