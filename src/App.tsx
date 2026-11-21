@@ -4,8 +4,8 @@ import { del, keys } from 'idb-keyval';
 import { BookOpen, UploadCloud, Download, Loader2, CheckCircle, Layout, FileText, AlertCircle, Settings, Play, Pause, Book, Type as TypeIcon, Globe, ArrowLeft, RotateCcw, Library, Moon, Sun, Trash2, Volume2, Square, Zap, Shield, ArrowRight, Layers, X, Info, Gauge, ChevronRight, ChevronDown, Check } from 'lucide-react';
 import { saveBookToLibrary, getLibraryBooks, deleteBookFromLibrary, SavedBook, loadSettings, saveSettings, savePendingJob, loadPendingJob, clearPendingJob, clearTranslationCache, PendingJob } from './lib/db';
 import { analyzeCEFR, getComprehensionPercentage, wordsToLearn, loadRankTable, frequentNames, levelOf, levelIndex, needsSimplifying, CEFRLevelStats } from './lib/cefr';
-import { XHTML_NS, resolveZipPath, loadChapterDoc, baseBookName, getTranslatableBlocks, highlightTerms, createSampleEpub, createPair, markLanguage, PAIR_CSS, buildGlossaryXhtml, updatePackageMetadata, addSpineItem, addToTableOfContents } from './lib/epub';
-import { translateBatch, simplifyBatch, llmCandidates, hasUsableLlm, QuotaWaitError } from './lib/translate';
+import { XHTML_NS, resolveZipPath, loadChapterDoc, baseBookName, getTranslatableBlocks, isFrontMatter, highlightTerms, createSampleEpub, createPair, markLanguage, PAIR_CSS, buildGlossaryXhtml, updatePackageMetadata, addSpineItem, addToTableOfContents } from './lib/epub';
+import { translateBatch, simplifyBatch, cachedSimplifications, llmCandidates, hasUsableLlm, QuotaWaitError } from './lib/translate';
 import { epubToPdf, pdfSupportsLanguage } from './lib/pdf';
 import { IDIOMS, LANGUAGES } from './constants';
 import type { LayoutType, EngineType, Chapter, AppConfig, GlossaryTerm, SimplifyLevel } from './types';
@@ -82,7 +82,8 @@ export default function App() {
   
   // `paragraphs`: how far the current chapter is, so the percentage moves within a long chapter
   // instead of only when a whole chapter is done.
-  const [progress, setProgress] = useState({ current: 0, total: 0, chapterTitle: '', paragraphs: { done: 0, total: 0 } });
+  // `overall`: `paragraphs` counts the whole book (English-only mode), not the current chapter.
+  const [progress, setProgress] = useState({ current: 0, total: 0, chapterTitle: '', paragraphs: { done: 0, total: 0 }, overall: false });
   const [isPaused, setIsPaused] = useState(false);
   const pauseRef = useRef(false);
   
@@ -133,7 +134,9 @@ export default function App() {
     const timer = setInterval(() => setClock(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [llmActivity]);
-  const progressPercent = progress.total
+  const progressPercent = progress.overall
+    ? (progress.paragraphs.total ? progress.paragraphs.done / progress.paragraphs.total * 100 : 100)
+    : progress.total
     ? Math.min(100, Math.max(0, (Math.max(0, progress.current - 1)
         + (progress.paragraphs.total ? progress.paragraphs.done / progress.paragraphs.total : 0)) / progress.total * 100))
     : 0;
@@ -141,7 +144,8 @@ export default function App() {
   // Told when an AI service fails for good (each service at most once per run, it is then skipped).
   const reportLlmError = (err: Error, nextService?: string) => {
     setErrorMsg(nextService
-      ? `${err.message} Çeviri ${nextService} ile sürüyor.`
+      ? `${err.message} ${englishOnly ? 'Sadeleştirme' : 'Çeviri'} ${nextService} ile sürüyor.`
+      : englishOnly ? err.message
       : `${err.message} Kalan paragraflar Google Translate ile çevriliyor. Ayarlar'da başka bir servisin (ör. Groq) anahtarını da girerseniz, kota dolunca otomatik olarak ona geçilir.`);
   };
 
@@ -243,7 +247,7 @@ export default function App() {
     setZipInstance(null);
     setOpfPath('');
     setChapters([]);
-    setProgress({ current: 0, total: 0, chapterTitle: '', paragraphs: { done: 0, total: 0 } });
+    setProgress({ current: 0, total: 0, chapterTitle: '', paragraphs: { done: 0, total: 0 }, overall: false });
     setIsPaused(false);
     pauseRef.current = false;
     setPreviews({});
@@ -596,13 +600,77 @@ export default function App() {
     const previewHtml = (htmlDoc: Document) =>
       (config.layout === 'columns' ? `<style>${PAIR_CSS}</style>` : '') + htmlDoc.body.innerHTML;
 
+    // Paragraphs worth rewriting: not headings, not very short lines, not on a copyright or
+    // contents page, and rated above the level by the analysis (rare words, long sentences).
+    const shouldSimplify = (el: Element, text: string, frontMatter: boolean) =>
+      simplifyLevel !== 'off' && !frontMatter && !/^h[1-6]$/.test(el.localName)
+      && text.split(' ').length >= SIMPLIFY_MIN_WORDS && needsSimplifying(text, simplifyLevel, rankTable);
+
+    // English-only book: the paragraphs to rewrite are collected from the whole book first and sent
+    // in full batches regardless of chapter boundaries (Gemini: 50 per request), so short chapters
+    // don't cost a request each and the per-minute and per-day request limits go much further.
+    // Rewrites are cached, so a resumed job only asks for what is still missing.
+    const rewrites = new Map<string, string>(); // `${chapterId}#${block index}` -> rewrite
+    if (englishOnly) {
+      const selected = chapters.filter(c => c.selected);
+      const items: { id: number; text: string; key: string; chapterNo: number; title: string }[] = [];
+      for (const chapter of chapters) {
+        if (!chapter.selected || chapter.status === 'done') continue;
+        const content = await zipInstance.file(chapter.fullPath)?.async('text');
+        if (!content) continue;
+        const doc = loadChapterDoc(content).doc;
+        const frontMatter = isFrontMatter(chapter.title, doc.body?.textContent || '');
+        getTranslatableBlocks(doc).forEach((el, k) => {
+          const text = blockText(el);
+          if (text && shouldSimplify(el, text, frontMatter)) {
+            items.push({ id: items.length, text, key: `${chapter.id}#${k}`, chapterNo: selected.indexOf(chapter) + 1, title: chapter.title });
+          }
+        });
+      }
+      const done = await cachedSimplifications(items, config, simplifyLevel);
+      const pending = items.filter(item => !done.has(item.id));
+      const batchSize = batchSizeOf(config);
+      for (let start = 0; start < pending.length; start += batchSize) {
+        if (pauseRef.current) return;
+        const batch = pending.slice(start, start + batchSize);
+        setProgress({ current: batch[0].chapterNo, total: selected.length, chapterTitle: batch[0].title, paragraphs: { done: done.size, total: items.length }, overall: true });
+        try {
+          const out = await simplifyBatch(batch, config, simplifyLevel, {
+            precedingText: items.slice(Math.max(0, batch[0].id - CONTEXT_PARAGRAPHS), batch[0].id).map(item => item.text),
+            names: bookNamesRef.current,
+            book: bookInfoRef.current,
+            bookLevel: cefrStats?.estimatedLevel,
+            onLlmError: reportLlmError,
+          });
+          out.forEach((text, id) => done.set(id, text));
+        } catch (err) {
+          if (err instanceof QuotaWaitError) {
+            // Every AI service is out of quota: pause and pick up again when the first one is back.
+            setErrorMsg('');
+            setQuotaResumeAt(err.resumeAt);
+            handlePause();
+            scheduleResume(err.resumeAt);
+            return;
+          }
+          if (isFatal(err) || !hasUsableLlm(config)) {
+            setErrorMsg(`Sadeleştirme durdu: ${(err as Error).message}`);
+            handlePause();
+            return;
+          }
+          console.error('Simplification batch failed', err); // these paragraphs stay as they are
+        }
+      }
+      done.forEach((text, id) => rewrites.set(items[id].key, text));
+      setProgress({ current: selected.length, total: selected.length, chapterTitle: 'Kitap hazırlanıyor...', paragraphs: { done: items.length, total: items.length }, overall: true });
+    }
+
     for (let i = 0; i < chapters.length; i++) {
       if (pauseRef.current) break;
       const chapter = chapters[i];
       if (!chapter.selected || chapter.status === 'done') continue;
 
       setChapters(prev => prev.map(c => c.id === chapter.id ? { ...c, status: 'processing' } : c));
-      setProgress(p => ({ ...p, current: processedCount + 1, chapterTitle: chapter.title, paragraphs: { done: 0, total: 0 } }));
+      if (!englishOnly) setProgress(p => ({ ...p, current: processedCount + 1, chapterTitle: chapter.title, paragraphs: { done: 0, total: 0 }, overall: false }));
 
       try {
         const content = await zipInstance.file(chapter.fullPath)?.async("text");
@@ -611,6 +679,7 @@ export default function App() {
         const htmlDoc = loadChapterDoc(content).doc;
         const elements = getTranslatableBlocks(htmlDoc);
         const texts = elements.map(blockText);
+        const frontMatter = isFrontMatter(chapter.title, htmlDoc.body?.textContent || '');
         // What each paragraph became: the (possibly simplified) English and its translation,
         // fed back to the model as context for the paragraphs that follow.
         const sourceUsed = [...texts];
@@ -624,7 +693,7 @@ export default function App() {
         const sequential = (config.engine === 'llm' || englishOnly) && hasUsableLlm(config);
         const batchSize = sequential ? batchSizeOf(config) : BATCH_SIZE;
         const waveSpan = batchSize * (sequential ? 1 : PARALLEL_BATCHES);
-        setProgress(p => ({ ...p, paragraphs: { done: 0, total: elements.length } }));
+        if (!englishOnly) setProgress(p => ({ ...p, paragraphs: { done: 0, total: elements.length } }));
         for (let start = 0; start < elements.length; start += waveSpan) {
           if (pauseRef.current) break;
           const wave: number[] = [];
@@ -649,17 +718,21 @@ export default function App() {
               bookLevel: cefrStats?.estimatedLevel,
               onLlmError: reportLlmError,
             };
+            // English-only book: the rewrites were made for the whole book above; nothing is translated.
+            if (englishOnly) {
+              const simplified = new Map<number, string>();
+              payload.forEach(p => {
+                const rewrite = rewrites.get(`${chapter.id}#${p.id}`);
+                if (rewrite) simplified.set(p.id, rewrite);
+              });
+              return { translations: [], simplified };
+            }
             // Graded-reader mode: rewrite the English first, then translate the rewritten text so
-            // both columns say the same thing. Only paragraphs the analysis rates above the level
-            // (rare words, long sentences) are rewritten; headings and very short lines never are.
+            // both columns say the same thing.
             const simplified = simplifyLevel === 'off' ? new Map<number, string>() : await simplifyBatch(
-              payload.filter(p => !/^h[1-6]$/.test(elements[p.id].localName)
-                && p.text.split(' ').length >= SIMPLIFY_MIN_WORDS
-                && needsSimplifying(p.text, simplifyLevel, rankTable)),
+              payload.filter(p => shouldSimplify(elements[p.id], p.text, frontMatter)),
               config, simplifyLevel, context,
             );
-            // English-only book: the simplified English is the whole result, nothing is translated.
-            if (englishOnly) return { translations: [], simplified };
             payload = payload.map(p => ({ id: p.id, text: simplified.get(p.id) ?? p.text }));
             const jobConfig = googleForThisJobRef.current ? { ...config, whenQuotaRunsOut: 'google' as const } : config;
             return { translations: await translateBatch(payload, jobConfig, pauseRef, context), simplified };
@@ -677,7 +750,7 @@ export default function App() {
             });
           }
 
-          setProgress(p => ({ ...p, paragraphs: { done: Math.min(start + waveSpan, elements.length), total: elements.length } }));
+          if (!englishOnly) setProgress(p => ({ ...p, paragraphs: { done: Math.min(start + waveSpan, elements.length), total: elements.length } }));
 
           // --- LIVE PREVIEW UPDATE ---
           setPreviews(prev => ({ ...prev, [chapter.id]: previewHtml(htmlDoc) }));
@@ -1870,7 +1943,9 @@ export default function App() {
                       {!isPaused && progress.total > 0 && progress.current > 0 && (
                         <p className={`text-xs ${isDarkMode ? 'text-slate-500' : 'text-slate-400'}`}>
                           Bölüm {Math.min(progress.current, progress.total)}/{progress.total}
-                          {progress.paragraphs.total > 0 && ` · paragraf ${progress.paragraphs.done}/${progress.paragraphs.total}`}
+                          {progress.paragraphs.total > 0 && (progress.overall
+                            ? ` · sadeleşen paragraf ${progress.paragraphs.done}/${progress.paragraphs.total}`
+                            : ` · paragraf ${progress.paragraphs.done}/${progress.paragraphs.total}`)}
                         </p>
                       )}
                       {!isPaused && llmActivity.kind === 'request' && clock - llmActivity.since > 5_000 && (

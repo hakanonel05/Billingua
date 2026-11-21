@@ -270,6 +270,18 @@ describe('simplifyBatch', () => {
   });
 });
 
+describe('simplifyBatch batching', () => {
+  it('sends a long list in requests of the service batch size', async () => {
+    const { llm } = installNetwork({ llmReply: modelThat(t => `simple ${t}`) });
+    const items = Array.from({ length: 25 }, (_, id) => ({ id, text: `The ubiquitous fog number ${id} enveloped the town.` }));
+    const cfg = config({ llmBaseUrl: 'http://batching.test/v1' }); // Ollama: 10 per request
+    const out = await simplifyBatch(items, cfg, 'B1');
+    expect(out.size).toBe(25);
+    expect(llm).toHaveLength(3);
+    expect(llm.map(c => JSON.parse(c.body.messages[1].content.slice(c.body.messages[1].content.indexOf('{"items"'))).items.length)).toEqual([10, 10, 5]);
+  });
+});
+
 describe('mapParagraphs request failures', () => {
   it('does not fall back to one request per paragraph when the batch request itself fails', async () => {
     const { llm } = installNetwork({ llmReply: () => new Response('bad request', { status: 400 }) });
