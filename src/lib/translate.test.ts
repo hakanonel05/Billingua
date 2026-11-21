@@ -1,12 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { AppConfig } from '../types';
 import { translateBatch, simplifyBatch, chunkByChars, translateWithLlm, QuotaWaitError } from './translate';
-import { parseJsonReply, parseItemsReply, mapParagraphs, LlmError, isFatal, stripThinking, isLlmConfigured, chat, parseRateLimit } from './llm';
+import { parseJsonReply, parseItemsReply, mapParagraphs, LlmError, isFatal, stripThinking, isLlmConfigured, chat, parseRateLimit, onLlmActivity, type LlmActivity } from './llm';
 
 const config = (overrides: Partial<AppConfig> = {}): AppConfig => ({
   sourceLang: 'en', targetLang: 'tr', layout: 'side-by-side', engine: 'gtx',
   llmProvider: 'ollama', llmBaseUrl: 'http://localhost:11434/v1', llmModel: 'test-model', llmApiKey: '', llmKeys: {},
-  simplifyLevel: 'off', whenQuotaRunsOut: 'google', buildGlossary: false,
+  simplifyLevel: 'off', outputMode: 'bilingual', simpleEnglishLevel: 'B1', whenQuotaRunsOut: 'google', buildGlossary: false,
   customBg: '', customColor: '', minCefrLevel: 'B1', extractIdioms: false,
   contextualGlossary: false, tone: 'default', customGlossary: '',
   fontFamily: 'serif', fontSize: '1em', lineSpacing: '1.5', ...overrides,
@@ -245,6 +245,54 @@ describe('simplifyBatch', () => {
 
   it('refuses to run without a model', async () => {
     await expect(simplifyBatch([{ id: 1, text: 'x' }], config({ llmModel: '' }), 'B1')).rejects.toThrow('model');
+  });
+
+  it('tells the model which words are above the level and how hard the original is', async () => {
+    const { llm } = installNetwork({ llmReply: modelThat(t => `simple ${t}`) });
+    await simplifyBatch(
+      [{ id: 1, text: 'The ubiquitous fog enveloped Ishmael and the town.' }],
+      config({ llmBaseUrl: 'http://hard-words.test/v1' }), 'B1', { bookLevel: 'C1', names: ['Ishmael'] },
+    );
+    const system = llm[0].body.messages[0].content;
+    expect(system).toContain('ubiquitous');
+    expect(system).toContain('about level C1');
+    expect(system).not.toMatch(/above B1: [^.]*\bthe\b/);
+  });
+
+  it('pauses until the quota is back instead of failing when every quota is spent', async () => {
+    const dailyQuota = JSON.stringify({ error: { code: 429, message: 'You exceeded your current quota', details: [
+      { violations: [{ quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier', quotaValue: '20' }] }, { retryDelay: '3600s' },
+    ] } });
+    installNetwork({ llmReply: () => new Response(dailyQuota, { status: 429 }) });
+    const cfg = config({ llmBaseUrl: 'http://simplify-quota.test/v1', llmModel: 'tired' });
+    await expect(simplifyBatch([{ id: 1, text: 'The ubiquitous fog enveloped the town.' }], cfg, 'B2'))
+      .rejects.toBeInstanceOf(QuotaWaitError);
+  });
+});
+
+describe('mapParagraphs request failures', () => {
+  it('does not fall back to one request per paragraph when the batch request itself fails', async () => {
+    const { llm } = installNetwork({ llmReply: () => new Response('bad request', { status: 400 }) });
+    const out = await mapParagraphs(config({ llmBaseUrl: 'http://broken.test/v1' }), 'Do it.', [
+      { id: 1, text: 'one' }, { id: 2, text: 'two' }, { id: 3, text: 'three' },
+    ]);
+    expect(out.size).toBe(0);
+    expect(llm).toHaveLength(2); // the batch and one retry of it, not three more single requests
+  });
+
+  it('reports a rate-limit wait so the progress screen can show it', async () => {
+    let calls = 0;
+    installNetwork({ llmReply: body => (calls++ === 0
+      ? new Response('slow down', { status: 429, headers: { 'retry-after': '0' } })
+      : 'ok') });
+    const seen: LlmActivity['kind'][] = [];
+    onLlmActivity(a => seen.push(a.kind));
+    try {
+      await chat(config({ llmBaseUrl: 'http://busy.test/v1' }), [{ role: 'user', content: 'x' }]);
+    } finally {
+      onLlmActivity(null);
+    }
+    expect(seen).toEqual(['request', 'rate-limit', 'request', 'idle']);
   });
 });
 

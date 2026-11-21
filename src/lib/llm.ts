@@ -144,7 +144,20 @@ const wantsNoReasoning = (s: LlmSettings) =>
 
 const MAX_BUSY_RETRIES = 4;
 const MAX_RETRY_WAIT_MS = 65_000;
+// A request that hasn't answered after this long is given up on, so a stalled connection can't
+// freeze a book (local models on a slow computer may need minutes for a batch).
+const REQUEST_TIMEOUT_MS = 5 * 60_000;
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// What the AI client is doing right now, for the progress screen: waiting for an answer, or
+// waiting out a per-minute rate limit before asking again. Without it a long wait looks like a hang.
+export type LlmActivity =
+  | { kind: 'request'; model: string; since: number }
+  | { kind: 'rate-limit'; model: string; until: number }
+  | { kind: 'idle' };
+let activityListener: ((a: LlmActivity) => void) | null = null;
+export const onLlmActivity = (fn: ((a: LlmActivity) => void) | null) => { activityListener = fn; };
+const report = (a: LlmActivity) => activityListener?.(a);
 
 // Retry-After in milliseconds (seconds or HTTP date), or null when absent.
 const headerRetryMs = (res: Response): number | null => {
@@ -216,34 +229,50 @@ export async function chat(
 
   // Free tiers (Groq, OpenRouter) limit requests and tokens per minute: wait as told and retry
   // instead of giving up on the model. Only a limit that outlasts the retries is reported.
+  const model = s.llmModel.trim();
   let res: Response;
-  for (let attempt = 0; ; attempt++) {
-    try {
-      res = await fetch(endpoint(s, '/chat/completions'), { method: 'POST', headers: headers(s), body: JSON.stringify(body), signal });
-    } catch (e) {
-      if ((e as Error)?.name === 'AbortError') throw e;
-      throw new LlmError(describeNetworkError(s), 0);
-    }
-    if (res.status === 400 && 'reasoning_effort' in body) {
-      rejectsNoReasoning.add(s.llmModel.trim());
-      delete body.reasoning_effort;
-      continue;
-    }
-    if (res.status === 429) {
-      const limit = parseRateLimit(await res.clone().text().catch(() => ''), headerRetryMs(res), s.llmModel.trim());
-      // A daily quota, or a wait longer than a minute, won't clear by retrying now.
-      if (limit.daily || (limit.retryMs ?? 0) > MAX_RETRY_WAIT_MS || attempt >= MAX_BUSY_RETRIES) {
-        throw new LlmError(limit.message, 429, limit.retryMs ?? undefined);
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+      try {
+        report({ kind: 'request', model, since: Date.now() });
+        res = await fetch(endpoint(s, '/chat/completions'), {
+          method: 'POST', headers: headers(s), body: JSON.stringify(body),
+          signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+        });
+      } catch (e) {
+        if (signal?.aborted) throw e;
+        if (timeout.aborted) {
+          // Not fatal: the batch keeps its Google draft and the book goes on.
+          throw new LlmError(`${model} ${Math.round(REQUEST_TIMEOUT_MS / 60_000)} dakika içinde yanıt vermedi.`, 408);
+        }
+        throw new LlmError(describeNetworkError(s), 0);
       }
-      await sleep(Math.min((limit.retryMs ?? 2000 * 2 ** attempt) + 250, MAX_RETRY_WAIT_MS));
-      continue;
+      if (res.status === 400 && 'reasoning_effort' in body) {
+        rejectsNoReasoning.add(s.llmModel.trim());
+        delete body.reasoning_effort;
+        continue;
+      }
+      if (res.status === 429) {
+        const limit = parseRateLimit(await res.clone().text().catch(() => ''), headerRetryMs(res), s.llmModel.trim());
+        // A daily quota, or a wait longer than a minute, won't clear by retrying now.
+        if (limit.daily || (limit.retryMs ?? 0) > MAX_RETRY_WAIT_MS || attempt >= MAX_BUSY_RETRIES) {
+          throw new LlmError(limit.message, 429, limit.retryMs ?? undefined);
+        }
+        const wait = Math.min((limit.retryMs ?? 2000 * 2 ** attempt) + 250, MAX_RETRY_WAIT_MS);
+        report({ kind: 'rate-limit', model, until: Date.now() + wait });
+        await sleep(wait);
+        continue;
+      }
+      // Transient server errors (Google's endpoint returns occasional 500s).
+      if (res.status >= 500 && attempt < MAX_BUSY_RETRIES) {
+        await sleep(retryDelayMs(res, attempt));
+        continue;
+      }
+      break;
     }
-    // Transient server errors (Google's endpoint returns occasional 500s).
-    if (res.status >= 500 && attempt < MAX_BUSY_RETRIES) {
-      await sleep(retryDelayMs(res, attempt));
-      continue;
-    }
-    break;
+  } finally {
+    report({ kind: 'idle' });
   }
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
@@ -323,7 +352,9 @@ export async function mapParagraphs(
       : '';
 
   const wanted = new Set(items.map(i => i.id));
-  const askBatch = async (batch: IdText[]) => {
+  // False when the request itself failed (timeout, server error) rather than the reply being
+  // incomplete: then asking paragraph by paragraph would only multiply failing requests.
+  const askBatch = async (batch: IdText[]): Promise<boolean> => {
     try {
       const reply = await chat(s, [
         { role: 'system', content: `${instruction}\nAnswer only with JSON of the form {"items":[{"id":<number>,"text":"<result>"}]}, one item per input, same ids, nothing else. Escape double quotes inside the text as \\".` },
@@ -332,16 +363,19 @@ export async function mapParagraphs(
       for (const r of parseItemsReply(reply)) {
         if (wanted.has(r.id) && r.text.trim()) results.set(r.id, r.text.trim());
       }
+      return true;
     } catch (err) {
       if (isFatal(err)) throw err;
       console.warn('Batch request failed', err);
+      return false;
     }
   };
 
   if (items.length > 1) {
-    await askBatch(items);
+    let answered = await askBatch(items);
     const missing = items.filter(i => !results.has(i.id));
-    if (missing.length > 1) await askBatch(missing);
+    if (missing.length > 1) answered = await askBatch(missing);
+    if (!answered) return results;
   }
 
   for (const item of items) {

@@ -14,6 +14,10 @@ export type EngineType = 'gtx' | 'llm' | 'gtx-fallback';
 
 export type SimplifyLevel = 'off' | 'A2' | 'B1' | 'B2';
 
+// 'bilingual': English with a translation; 'simple-english': the book rewritten in simpler
+// English only, with no translation at all.
+export type OutputMode = 'bilingual' | 'simple-english';
+
 export interface Chapter {
   id: string;
   title: string;
@@ -35,6 +39,9 @@ export interface AppConfig {
   // Keys per service (provider id -> key); llmApiKey is the one for the selected service.
   llmKeys: Record<string, string>;
   simplifyLevel: SimplifyLevel;
+  outputMode: OutputMode;
+  // Target level of the English-only simplified book.
+  simpleEnglishLevel: 'B1' | 'B2';
   // When every AI service is out of quota: pause until one is back, or finish with Google Translate.
   whenQuotaRunsOut: 'wait' | 'google';
   buildGlossary: boolean;

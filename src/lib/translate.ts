@@ -2,6 +2,7 @@ import type { MutableRefObject } from 'react';
 import type { AppConfig, SimplifyLevel, TranslationPayload, TranslationResult } from '../types';
 import { getCachedTranslations, setCachedTranslations } from './db';
 import { isFatal, isLlmConfigured, mapParagraphs, batchSizeOf, LLM_PRESETS, type LlmError } from './llm';
+import { loadRankTable, textDifficulty } from './cefr';
 
 export interface TranslateContext {
   // Source paragraphs right before this batch, so the model knows who "he" is (AI engine only).
@@ -13,6 +14,8 @@ export interface TranslateContext {
   previousPairs?: { source: string; translation: string }[];
   // Title and author, so the model knows what kind of book it is translating (AI engine only).
   book?: { title?: string; author?: string };
+  // Estimated CEFR level of the original, for the simplifier (AI engine only).
+  bookLevel?: string;
   // Told when an AI service fails for good (server down, bad key, quota), and which service takes
   // over (undefined: Google Translate), so the UI can say so.
   onLlmError?: (err: Error, nextService?: string) => void;
@@ -248,7 +251,17 @@ export async function simplifyBatch(
   if (pending.length === 0) return results;
 
   let instruction = `You rewrite fiction and non-fiction for English learners at CEFR level ${level}. Rewrite the text in simpler English. ${SIMPLIFY_GUIDE[level]} Keep every event, fact, line of dialogue and name, in the same order; do not summarize, shorten the story or add anything. Keep quotation marks around dialogue.`;
+  if (context.book?.title) instruction += ` The text comes from "${context.book.title}"${context.book.author ? ` by ${context.book.author}` : ''}.`;
+  if (context.bookLevel) instruction += ` The original is written at about level ${context.bookLevel}.`;
   if (context.names?.length) instruction += ` Keep these names exactly as written: ${context.names.join(', ')}.`;
+  // The words a frequency analysis rates above the level: the ones most worth replacing.
+  const table = await loadRankTable();
+  const hardWords = [...new Set(pending.flatMap(t => textDifficulty(t.text, level, table).hardWords))]
+    .filter(w => !context.names?.some(n => n.toLowerCase() === w))
+    .slice(0, 60);
+  if (hardWords.length) {
+    instruction += ` These words in the texts are probably above ${level}: ${hardWords.join(', ')}. Replace them with common words, or explain them briefly in simple words when there is no simple equivalent.`;
+  }
 
   let lastError: unknown;
   const done = await withLlmFallback(config, {
@@ -265,8 +278,13 @@ export async function simplifyBatch(
     await setCachedTranslations(fresh);
     return true;
   });
-  // Simplifying has no Google fallback: when every AI service is out, stop and say why.
-  if (!done && lastError) throw lastError;
+  // Simplifying has no Google fallback: when every AI service is out of quota, pause until the
+  // first one is back; for any other failure (bad key, server down) stop and say why.
+  if (!done && lastError) {
+    const resumeAt = llmAvailableAt(config);
+    if ((lastError as LlmError).status === 429 && resumeAt && !hasUsableLlm(config)) throw new QuotaWaitError(resumeAt);
+    throw lastError;
+  }
   return results;
 }
 

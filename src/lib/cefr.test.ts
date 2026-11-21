@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   parseRankTable, lemmaCandidates, levelOf, analyzeCEFR, findProperNouns,
-  getComprehensionPercentage, wordsToLearn, frequentNames,
+  getComprehensionPercentage, wordsToLearn, frequentNames, textDifficulty, needsSimplifying,
 } from './cefr';
 
 const table = parseRankTable(fs.readFileSync(path.join(__dirname, '../data/en-freq.txt'), 'utf-8'));
@@ -103,5 +103,30 @@ describe('analyzeCEFR', () => {
   it('suggests words above the reader level', () => {
     expect(wordsToLearn(stats, 'B2').map(w => w.word)).toContain('ubiquitous');
     expect(wordsToLearn(stats, 'C2')).toEqual([]);
+  });
+});
+
+describe('paragraph difficulty', () => {
+  it('lists the words above the level, skipping names and contractions', () => {
+    const d = textDifficulty("Ishmael didn't see the ubiquitous fog. It was cold.", 'B1', table);
+    expect(d.hardWords).toContain('ubiquitous');
+    expect(d.hardWords).not.toContain('ishmael');
+    expect(d.hardWords.some(w => w.includes("'"))).toBe(false);
+    expect(d.words).toBe(9);
+    expect(d.longestSentence).toBe(6);
+  });
+
+  it('leaves plain paragraphs alone and flags hard or long ones', () => {
+    expect(needsSimplifying('She opened the door and walked into the kitchen. The house was quiet.', 'B1', table)).toBe(false);
+    expect(needsSimplifying('The ubiquitous fog enveloped the town.', 'B1', table)).toBe(true);
+    const long = Array.from({ length: 30 }, () => 'and the man went home').join(' ') + '.';
+    expect(needsSimplifying(long, 'B2', table)).toBe(true);
+  });
+
+  it('is stricter at B1 than at B2', () => {
+    const text = 'He felt a sudden and overwhelming sense of relief when the letter finally arrived.';
+    const b1 = textDifficulty(text, 'B1', table);
+    const b2 = textDifficulty(text, 'B2', table);
+    expect(b1.hardCount).toBeGreaterThanOrEqual(b2.hardCount);
   });
 });
