@@ -73,6 +73,7 @@ export default function App() {
     extractIdioms: true,
     contextualGlossary: true,
     tone: 'default',
+    translationStyle: 'literary',
     customGlossary: '',
     fontFamily: 'sans-serif',
     fontSize: '1em',
@@ -1485,6 +1486,31 @@ export default function App() {
                         <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
                       </div>
                     </div>
+                  </div>
+
+                  <div className="md:col-span-2 space-y-3">
+                    <label className={`block text-sm font-semibold ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>Çeviri Tarzı</label>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                      {([
+                        { id: 'learner', name: 'Öğrenci için (İngilizceye yakın)', desc: 'Her İngilizce cümleye bir Türkçe cümle, aynı sırada; kelimeler en yaygın anlamlarıyla. Orijinali anlamak ve kelimeleri eşleştirmek için.' },
+                        { id: 'literary', name: 'Edebi (doğal Türkçe)', desc: 'Yayınlanmış bir çeviri gibi akıcı; cümleler Türkçeye göre yeniden kurulur, İngilizceyle birebir eşleşmez.' },
+                      ] as const).map(t => {
+                        const active = config.translationStyle === t.id;
+                        return (
+                          <button
+                            key={t.id}
+                            onClick={() => setConfig(c => ({ ...c, translationStyle: t.id }))}
+                            className={`text-left p-4 rounded-2xl border-2 transition-all ${active ? (isDarkMode ? 'border-blue-500 bg-blue-900/30' : 'border-blue-600 bg-blue-50/50') : isDarkMode ? 'border-slate-700 bg-slate-900 hover:border-slate-600' : 'border-slate-200 bg-white hover:border-slate-300'}`}
+                          >
+                            <div className={`font-semibold text-sm ${active ? (isDarkMode ? 'text-blue-300' : 'text-blue-900') : isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>{t.name}</div>
+                            <div className="text-xs mt-1 text-slate-500">{t.desc}</div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {config.engine === 'gtx' && (
+                      <p className="text-xs text-slate-500">Google Translate tek başına zaten İngilizceye yakın çevirir; bu seçenek yapay zekalı motorlarda etkilidir.</p>
+                    )}
                   </div>
 
                   <div className="space-y-2">

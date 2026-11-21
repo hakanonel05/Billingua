@@ -51,6 +51,9 @@ export interface AppConfig {
   extractIdioms: boolean;
   contextualGlossary: boolean;
   tone: 'default' | 'formal' | 'casual' | 'literary' | 'simple';
+  // 'literary': natural, publishable prose; 'learner': close to the English, sentence for
+  // sentence, for a reader who uses the translation to understand the original.
+  translationStyle: 'literary' | 'learner';
   customGlossary: string;
   fontFamily: string;
   fontSize: string;
