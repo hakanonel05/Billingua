@@ -1,12 +1,19 @@
 # Builds the desktop apps: Windows (.exe) and macOS (.dmg).
 # A pushed version tag (v1.0.0) also publishes them on the repository's Releases page;
-# "Run workflow" on the Actions tab builds them as downloadable artifacts only.
+# "Run workflow" on the Actions tab builds them as downloadable artifacts only, unless a version
+# (v1.0.6) is given: then the release and its tag are created from the chosen branch, the same way
+# as for a pushed tag.
 name: Desktop builds
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Yayınlanacak sürüm (ör. v1.0.6). Boş bırakılırsa yalnızca derlenir.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -53,7 +60,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.tag, 'v')
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -64,6 +71,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
           files: artifacts/*
           body: |
             ## İndirme
