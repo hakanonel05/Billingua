@@ -8,7 +8,7 @@ const config = (overrides: Partial<AppConfig> = {}): AppConfig => ({
   llmProvider: 'ollama', llmBaseUrl: 'http://localhost:11434/v1', llmModel: 'test-model', llmApiKey: '', llmKeys: {},
   simplifyLevel: 'off', outputMode: 'bilingual', simpleEnglishLevel: 'B1', whenQuotaRunsOut: 'google', buildGlossary: false,
   customBg: '', customColor: '', minCefrLevel: 'B1', extractIdioms: false,
-  contextualGlossary: false, tone: 'default', customGlossary: '',
+  contextualGlossary: false, tone: 'default', translationStyle: 'literary', customGlossary: '',
   fontFamily: 'serif', fontSize: '1em', lineSpacing: '1.5', ...overrides,
 });
 
@@ -279,6 +279,23 @@ describe('simplifyBatch batching', () => {
     expect(out.size).toBe(25);
     expect(llm).toHaveLength(3);
     expect(llm.map(c => JSON.parse(c.body.messages[1].content.slice(c.body.messages[1].content.indexOf('{"items"'))).items.length)).toEqual([10, 10, 5]);
+  });
+});
+
+describe('translation style', () => {
+  it('asks for a close, sentence-for-sentence translation in learner style', async () => {
+    const { llm } = installNetwork({ llmReply: modelThat(t => `tr:${t}`) });
+    await translateWithLlm([{ id: 1, text: 'He gave up.' }], config({ llmBaseUrl: 'http://learner.test/v1', translationStyle: 'learner' }));
+    const system = llm[0].body.messages[0].content;
+    expect(system).toContain('learning');
+    expect(system).toContain('one Turkish sentence for each sentence');
+    expect(system).not.toContain('literary translator');
+  });
+
+  it('keeps the literary instructions by default', async () => {
+    const { llm } = installNetwork({ llmReply: modelThat(t => `tr:${t}`) });
+    await translateWithLlm([{ id: 1, text: 'He gave up.' }], config({ llmBaseUrl: 'http://literary.test/v1' }));
+    expect(llm[0].body.messages[0].content).toContain('literary translator');
   });
 });
 

@@ -128,7 +128,8 @@ const hash = (s: string) => {
 const GTX_NS = 'gtx';
 // "d1": translations refined from a Google draft (kept apart from older from-scratch results).
 const llmNamespace = (config: AppConfig) =>
-  `llm-d1:${hash(config.llmBaseUrl.trim())}:${config.llmModel.trim()}:${config.tone}:${hash(config.customGlossary || '')}`;
+  `llm-d1:${hash(config.llmBaseUrl.trim())}:${config.llmModel.trim()}:${config.tone}:${hash(config.customGlossary || '')}`
+  + (config.translationStyle === 'learner' ? ':learner' : '');
 const cacheKey = (ns: string, config: AppConfig, text: string) =>
   `${ns}|${config.sourceLang}>${config.targetLang}|${text}`;
 
@@ -163,11 +164,25 @@ export async function translateWithLlm(
   onResults?: (results: TranslationResult[]) => void,
 ): Promise<TranslationResult[]> {
   const target = languageName(config.targetLang);
-  const lines = [`You are an experienced literary translator from ${languageName(config.sourceLang)} into ${target}.`];
+  const source = config.sourceLang === 'auto' ? 'English' : languageName(config.sourceLang);
+  const learner = config.translationStyle === 'learner';
+  const lines = [learner
+    ? `You translate from ${languageName(config.sourceLang)} into ${target} for a ${target} speaker who is learning ${source}. The reader reads the original and your translation side by side and uses the translation to understand the original sentence by sentence, word by word.`
+    : `You are an experienced literary translator from ${languageName(config.sourceLang)} into ${target}.`];
   if (context.book?.title) {
     lines.push(`You are translating the book "${context.book.title}"${context.book.author ? ` by ${context.book.author}` : ''}.`);
   }
-  lines.push(
+  if (learner) lines.push(
+    `Write a faithful learner's translation, not a literary one:`,
+    `- Keep the same sentences in the same order: one ${target} sentence for each sentence of the original. Never merge, split or reorder sentences.`,
+    `- Stay as close to the original wording and structure as correct ${target} grammar allows, so the reader can match each part of the sentence. Do not paraphrase, embellish or rephrase for style.`,
+    `- Translate each word with its most common, plain meaning, using everyday ${target} words rather than literary or rare ones. Keep the original's tenses where ${target} allows it.`,
+    `- Idioms and phrasal verbs ("give up", "ran into", "it's raining cats and dogs") cannot be translated word for word: give their meaning plainly.`,
+    `- Read the source in its own variety of English: in British English a "torch" is a flashlight, "trainers" are sneakers, a "flat" is an apartment.`,
+    `- Keep the dialogue quotation marks of the original, and keep names, recurring terms and forms of address consistent with the previous passage.`,
+    `- Translate every sentence completely: leave nothing out, add nothing, and never add notes or explanations.`,
+  );
+  else lines.push(
     `Write the way a skilled ${target} translator would publish it:`,
     `- Translate the meaning, not word for word. Render idioms, phrasal verbs and figurative verbs (someone who "barked" or "snapped" a reply, "shook" with fear) with the natural ${target} expression for what is meant.`,
     `- Use natural ${target} word order, rhythm and punctuation. Keep the dialogue quotation marks of the original.`,
@@ -183,7 +198,9 @@ export async function translateWithLlm(
   if (config.tone !== 'default') lines.push(`- Use a ${config.tone} tone.`);
   if (context.names?.length) lines.push(`- Keep these names exactly as written: ${context.names.join(', ')}.`);
   if (drafts.size) {
-    lines.push(`- Items come with "draft", a machine translation. It is often literal and sometimes wrong: use it only as a reference for the meaning. Fix mistranslations, word-for-word idioms, wrong word senses, unnatural word order and leftover English words. Give your own final, polished translation of "text", not a comment on the draft.`);
+    lines.push(learner
+      ? `- Items come with "draft", a machine translation. Its closeness to the original is often right for this reader; keep its structure where it is correct, and fix mistranslations, word-for-word idioms, wrong word senses, grammar errors and leftover English words. Give your own final translation of "text", not a comment on the draft.`
+      : `- Items come with "draft", a machine translation. It is often literal and sometimes wrong: use it only as a reference for the meaning. Fix mistranslations, word-for-word idioms, wrong word senses, unnatural word order and leftover English words. Give your own final, polished translation of "text", not a comment on the draft.`);
   }
   if (config.customGlossary) lines.push(`Follow these glossary rules:\n${config.customGlossary}`);
 
